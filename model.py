@@ -3,25 +3,7 @@ from random import choice
 from itertools import pairwise
 import numpy as np
 import matplotlib.pyplot as plt
-
-class Spin:
-    def __init__(self, value: np.float32, _id=0):
-        assert value in (1., -1.), "Spins can only have value +/- 1."
-        self.value = value
-        self.id = _id
-        self.initialised = False
-        self.nearest_neighbours = None
-
-    def __repr__(self):
-        d = "up" if self.value == 1. else "down"
-        return f"spin-{d}@{self.id}"
-
-    def initialise(self, nearest_neighbours: np.ndarray):
-        self.nearest_neighbours = nearest_neighbours
-        self.initialised = True
-
-    def flip(self):
-        self.value *= -1
+from spin import Spin
 
 
 class Model:
@@ -51,10 +33,46 @@ class Model:
         lattice, this means the neighbours along the x-y axes, without
         diagonals and without periodic boundary conditions.
         """
-        nn_pairs = self.get_nn_pairs()
-        pairs_product = np.array([s_i * s_j for s_i, s_j in nn_pairs])
-        spins = np.array([spin.value for spin in self.spins])
-        return -self.J * np.sum(pairs_product) - self.H * np.sum(spins)
+        return -self.J * self.nn_sum - self.H * self.magnetisation
+
+    @property
+    def magnetisation(self) -> np.float32:
+        """
+        Calculate the magnetisation of the system, equivalent to summing all
+        the spins in the system. Useful for calculations of probabilities and
+        energies for the model.
+        """
+        vals = (spin.value for spin in self.spins)
+        return sum(vals)
+
+    @property
+    def nn_sum(self) -> np.float32:
+        """
+        Calculate the sum of spin products over nearest neighbour pairs for
+        the model.
+        """
+        pairs = self.get_nn_pairs()
+        prod = (s_i.value * s_j.value for s_i, s_j in pairs)
+        return sum(prod)
+
+    @property
+    def inverse_temp(self) -> np.float32:
+        """
+        Calculate the inverse temperature of the system.
+        """
+        k_b = 1.380649e-23
+        return 1.0 / (self.T * k_b)
+
+    @property
+    def z_prob(self) -> np.float32:
+        """
+        Calculate the (not normalized) probability of finding the model in the
+        current microstate. This is not normalized because this is just the
+        numerator of the Boltzmann distribution probability; in other words,
+        this is the value of the probaility multiplied through by the partition
+        function.
+        """
+        return np.exp(-self.inverse_temp * self.energy)
 
     def get_nn_pairs(self) -> Iterator[Tuple[Spin, Spin]]:
         """
@@ -88,8 +106,7 @@ class Model:
         # In the top left corner, we only have two neighbours
         s = self.spins[0]
         neighbours = [self.spins[1], self.spins[l]]
-        s.nearest_neighbours = neighbours
-        s.initialised = True
+        s.initialise(np.array(neighbours))
 
         # for each spin in the top row there are three neighbours...
         for col in range(1, l-1):
@@ -99,14 +116,12 @@ class Model:
                 self.spins[col+1],
                 self.spins[col+l]
             ]
-            s.nearest_neighbours = neighbours
-            s.intialised = True
+            s.initialise(np.array(neighbours))
 
         # ...except the top right, with only two neighbours, again
         s = self.spins[l-1]
         neighbours = [self.spins[l-2], self.spins[2*l - 1]]
-        s.nearest_neighbours = neighbours
-        s.initialised = True
+        s.initialise(np.array(neighbours))
 
         for row in range(1, l-1):
             s = self.spins[l * row]
@@ -115,8 +130,7 @@ class Model:
                 self.spins[l * row + 1],  # right
                 self.spins[l * (row+1)]   # below
             ]
-            s.nearest_neighbours = neighbours
-            s.initialised = True
+            s.initialise(np.array(neighbours))
 
             for col in range(1, l-1):
                 s = self.spins[l * row + col]
@@ -126,8 +140,7 @@ class Model:
                     self.spins[l * (row+1) + col],  # below
                     self.spins[l * row + col - 1]   # left
                 ]
-                s.nearest_neighbours = neighbours
-                s.initialised = True
+                s.initialise(np.array(neighbours))
 
             s = self.spins[l * (row+1) - 1]
             neighbours = [
@@ -135,8 +148,7 @@ class Model:
                 self.spins[l * (row+1) - 2],  # left
                 self.spins[l * (row+2) - 1]   # below
             ]
-            s.nearest_neighbours = neighbours
-            s.initialised = True
+            s.initialise(np.array(neighbours))
 
         # In the bottom left corner, we only have two neighbours
         s = self.spins[l * (l-1)]
@@ -144,8 +156,7 @@ class Model:
             self.spins[l * (l-2)],     # above
             self.spins[l * (l-1) + 1]  # right
         ]
-        s.nearest_neighbours = neighbours
-        s.initialised = True
+        s.initialise(np.array(neighbours))
 
         # for each spin in the bottom row there are three neighbours...
         for col in range(1, l-1):
@@ -155,15 +166,12 @@ class Model:
                 self.spins[l * (l-1) + col+1],  # right
                 self.spins[l * (l-2) + col]     # above
             ]
-            s.nearest_neighbours = neighbours
-            s.intialised = True
+            s.initialise(np.array(neighbours))
 
         # ...except the bottom right, with only two neighbours, again
         s = self.spins[l**2 - 1]
         neighbours = [self.spins[l**2-2], self.spins[l * (l-1) - 1]]
-        s.nearest_neighbours = neighbours
-        s.initialised = True
-            
+        s.initialise(np.array(neighbours))
 
     def plot(self, filename: str | None=None):
         """
@@ -187,8 +195,11 @@ class Model:
 
 
 if __name__ == "__main__":
-    m = Model(4, 5, 6, 7)
+    m = Model(40, 5, 6, 7)
     m.define_nn_pairs()
-    for spin in m.spins:
-        print(spin, spin.nearest_neighbours)
+    print(m.magnetisation)
+    print(m.nn_sum)
+    print(m.energy)
+    print(m.inverse_temp)
+    print(m.z_prob)
     m.plot()
