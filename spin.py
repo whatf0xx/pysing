@@ -6,7 +6,7 @@ class Spin:
     A spin within an Ising model. Holds a value, +/- 1; a list of its nearest
     neighbours in the model, and an ID, for debugging.
     """
-    def __init__(self, value: np.float32, _id=0):
+    def __init__(self, value: np.float64, _id=0):
         assert value in (1., -1.), "Spins can only have value +/- 1."
         self.value = value
         self.id = _id
@@ -31,3 +31,10 @@ class Spin:
         Invert the value/direction of the spin.
         """
         self.value *= -1
+
+    def nn_sum(self) ->  np.float64:
+        """
+        Sum the spins of the nearest neighbours of `self`.
+        """
+        vals = (spin.value for spin in self.nearest_neighbours)
+        return sum(vals)

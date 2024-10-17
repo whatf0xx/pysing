@@ -1,6 +1,6 @@
 from typing import Tuple, Iterator
-from random import choice
-from itertools import pairwise
+from random import choice, choices
+from itertools import pairwise, product
 import numpy as np
 import matplotlib.pyplot as plt
 from spin import Spin
@@ -9,24 +9,26 @@ from spin import Spin
 class Model:
     """
     An instance of the Ising model, defined on a square lattice with
-    `lattice_length` spins in each direction.
+    `lattice_length` spins in each direction. The default value for the
+    temperature gives an inverse temperature of approximately unity.
     """
     def __init__(self,
                  lattice_length: int,
-                 temperature: np.float32,
-                 field: np.float32,
-                 coupling: np.float32
+                 temperature: np.float64=7.2429705e+22,
+                 field: np.float64=0.,
+                 coupling: np.float64=1.0e-2
              ):
         self.lattice_length = lattice_length
         self.spins = np.array(
                             [Spin(choice((1., -1.)), _id=i) for i in range(lattice_length ** 2)]
                         )
+        self.define_nn_pairs()
         self.T = temperature
         self.H = field
         self.J = coupling
 
     @property
-    def energy(self) -> np.float32:
+    def energy(self) -> np.float64:
         """
         Calculate the energy of the system, according to the standard
         'nearest-neightbours' approach of the Ising model. For the square
@@ -36,7 +38,7 @@ class Model:
         return -self.J * self.nn_sum - self.H * self.magnetisation
 
     @property
-    def magnetisation(self) -> np.float32:
+    def magnetisation(self) -> np.float64:
         """
         Calculate the magnetisation of the system, equivalent to summing all
         the spins in the system. Useful for calculations of probabilities and
@@ -46,7 +48,7 @@ class Model:
         return sum(vals)
 
     @property
-    def nn_sum(self) -> np.float32:
+    def nn_sum(self) -> np.float64:
         """
         Calculate the sum of spin products over nearest neighbour pairs for
         the model.
@@ -56,7 +58,7 @@ class Model:
         return sum(prod)
 
     @property
-    def inverse_temp(self) -> np.float32:
+    def inverse_temp(self) -> np.float64:
         """
         Calculate the inverse temperature of the system.
         """
@@ -64,15 +66,35 @@ class Model:
         return 1.0 / (self.T * k_b)
 
     @property
-    def z_prob(self) -> np.float32:
+    def z_prob(self) -> np.float64:
         """
         Calculate the (not normalized) probability of finding the model in the
         current microstate. This is not normalized because this is just the
         numerator of the Boltzmann distribution probability; in other words,
-        this is the value of the probaility multiplied through by the partition
+        this is the value of the probability multiplied by the partition
         function.
         """
         return np.exp(-self.inverse_temp * self.energy)
+
+    @property
+    def probability_gradient(self) -> np.ndarray:
+        """
+        Calculate the (not normalized) gradient of the probability with respect
+        to the spins of the system. the gradient is taken over the product of
+        the probability of the microstate and the partition function (see the
+        `z_prob` property), so its really the gradient of the numerator of the
+        Boltzmann distribution. There should also be a factor of the probability
+        of the microstate, but this is removed for now for numerical simplicity
+        as this should affect all the spins the same, anyway.
+        """
+        beta = self.inverse_temp
+        H = self.H
+        J = self.J
+        # p = self.z_prob
+        return np.array(
+            [beta * (H + J * spin.nn_sum()) for spin in self.spins]
+        )
+
 
     def get_nn_pairs(self) -> Iterator[Tuple[Spin, Spin]]:
         """
@@ -193,13 +215,50 @@ class Model:
         else:
             plt.show()
 
+    def plot_to_axes(self, ax: plt.Axes):
+        """
+        For debugging purposes, plot the current state of the model as a
+        bitmap.
+        """
+        data = np.array([(spin.value + 1) / 2 for spin in self.spins])
+        bitmap = data.reshape((self.lattice_length, self.lattice_length))
+
+        ax.imshow(bitmap, cmap="magma")
+
+    @property
+    def evolution_probs(self) -> np.ndarray:
+        """
+        Calculate the probability for transforming to spin up (1.) when the
+        model evolves.
+        """
+        return (1 + np.tanh(self.probability_gradient)) / 2
+
+    def evolve(self):
+        """
+        According to the calculated probability gradient, let the system evolve
+        into a more likely state.
+        """
+        for spin, p in zip(self.spins, self.evolution_probs):
+            spin.value = choices([-1., 1.], weights=[1-p, p], k=1)[0]
+
 
 if __name__ == "__main__":
-    m = Model(40, 5, 6, 7)
-    m.define_nn_pairs()
-    print(m.magnetisation)
-    print(m.nn_sum)
-    print(m.energy)
-    print(m.inverse_temp)
-    print(m.z_prob)
-    m.plot()
+    m = Model(60, field=-6.0e-1, coupling=6.0e-1)
+    s = 4
+    fig, axs = plt.subplots(nrows=s, ncols=s, figsize=(9,9))
+    for i, j in product(range(s), range(s)):
+        m.plot_to_axes(axs[i][j])
+        axs[i][j].set_title(f"Step {s*i+j}")
+        # print(f"Beta={m.inverse_temp}")
+        # print(m.probability_gradient)
+        # print(m.evolution_probs)
+        m.evolve()
+
+    # for _ in range(100):
+    #     m.evolve()
+    # m.plot_to_axes(axs[s-1][s-1])
+    # axs[s-1][s-1].set_title(f"Step {s**2 + 100}")
+
+    plt.setp(plt.gcf().get_axes(), xticks=[], yticks=[])
+    fig.tight_layout()
+    plt.show()
