@@ -245,7 +245,7 @@ class Model:
 
 
 if __name__ == "__main__":
-    m = Model(60, field=-6.0e-6, coupling=6.0e1)
+    m = Model(200, field=-6.0e-6, coupling=5.4e-1)
     s = 4
     t = 5
     fig, axs = plt.subplots(nrows=s, ncols=s, figsize=(9,9))
