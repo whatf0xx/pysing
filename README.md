@@ -17,7 +17,7 @@ See my blog entry: TBC
 
 ## Example
 
-![Ising model microstates](https://github.com/whatf0xx/pysing/blob/master/example.png?raw=true)
+![Ising model microstates](https://github.com/whatf0xx/pysing/blob/main/example.png?raw=true)
 
 ## How to
 
