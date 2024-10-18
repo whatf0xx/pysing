@@ -1,6 +1,6 @@
 from typing import Tuple, Iterator
 from random import choice, choices, random
-from itertools import pairwise, product
+from itertools import pairwise
 import numpy as np
 import matplotlib.pyplot as plt
 from spin import Spin
@@ -242,27 +242,3 @@ class Model:
             if random() > 0.4:
                 # don't update all spins to avoid back-and-forth flipping
                 spin.value = choices([-1., 1.], weights=[1-p, p], k=1)[0]
-
-
-if __name__ == "__main__":
-    m = Model(200, field=-6.0e-6, coupling=5.4e-1)
-    s = 4
-    t = 5
-    fig, axs = plt.subplots(nrows=s, ncols=s, figsize=(9,9))
-    for i, j in product(range(s), range(s)):
-        m.plot_to_axes(axs[i][j])
-        axs[i][j].set_title(f"Step {(s*i+j) * t}")
-        # print(f"Beta={m.inverse_temp}")
-        # print(m.probability_gradient)
-        # print(m.evolution_probs)
-        for _ in range(t):
-            m.evolve()
-
-    # for _ in range(100):
-    #     m.evolve()
-    # m.plot_to_axes(axs[s-1][s-1])
-    # axs[s-1][s-1].set_title(f"Step {s**2 + 100}")
-
-    plt.setp(plt.gcf().get_axes(), xticks=[], yticks=[])
-    fig.tight_layout()
-    plt.show()
