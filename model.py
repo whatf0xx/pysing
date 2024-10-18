@@ -28,6 +28,19 @@ class Model:
         self.J = coupling
 
     @property
+    def critical_temp(self) -> np.float64:
+        """
+        Calculate the temperature of the system in units of the critical
+        temperature, i.e. see how close the system is to criticality. The
+        calculation is based on Onsager's exact solution to the Ising model
+        on a square lattice in two dimensions; see Wikipedia.
+        """
+        beta = self.inverse_temp
+        j = self.J
+        prod = beta * j
+        return 0.440687 / prod
+        
+    @property
     def energy(self) -> np.float64:
         """
         Calculate the energy of the system, according to the standard
@@ -239,6 +252,6 @@ class Model:
         into a more likely state.
         """
         for spin, p in zip(self.spins, self.evolution_probs):
-            if random() > 0.4:
+            if random() > 0.2:
                 # don't update all spins to avoid back-and-forth flipping
                 spin.value = choices([-1., 1.], weights=[1-p, p], k=1)[0]
