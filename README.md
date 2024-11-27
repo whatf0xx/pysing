@@ -13,7 +13,7 @@ Then look no further, this is the repository for you!
 
 ### How it works
 
-See my blog entry: TBC
+See [this blog entry](https://whatf0xx.github.io/simulation/physics/thermodynamics/ising/2024/10/21/pysing-model.html).
 
 ## Example
 
@@ -21,6 +21,11 @@ See my blog entry: TBC
 
 ## How to
 
-Clone the repository into a new folder. Add matplotlib and numpy to a virtual environment.
-
-`python -m run`
+```
+git clone git@github.com:whatf0xx/pysing.git
+cd pysing
+python -m venv .env
+source .env/bin/activate
+pip install -r requirements.txt
+python -m run
+```
