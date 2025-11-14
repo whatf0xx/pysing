@@ -1,25 +1,26 @@
-from itertools import product
 import matplotlib.pyplot as plt
-from tqdm.contrib.itertools import product
+from tqdm import trange
 from model import Model
 
 
 if __name__ == "__main__":
-    fig, axs = plt.subplots(3, 3)
-    for i, j, k in product(range(3), range(3), range(80)):
-        if k == 0:
-            h = float(f"{1+4*i}.0e-2")
-            k = float(f"{j+3}.4e-1")
-            m = Model(250, field=h, coupling=k)
+    k = 3e-1
+    h = 1
+    field_time = 10
+    relax_time = 50
+    m = Model(
+              300,
+              field=h,
+              coupling=k,
+          )
+    magnetisation = [m.magnetisation]
+    for i in trange(field_time + relax_time):
+        if i == field_time:
+            m.H = 0
         m.evolve()
+        magnetisation.append(m.magnetisation)
 
-        m.plot_to_axes(axs[i][j])
-        axs[i][j].set_title(
-            f"$H={h:.2f}; T={m.critical_temp:.2f} T_c$", fontsize=8
-        )
-
-    plt.setp(plt.gcf().get_axes(), xticks=[], yticks=[])
-    fig.suptitle("Ising model microstates for varying $(H, T)$", fontsize=10)
-    fig.tight_layout()
-    plt.savefig(fname="exampel.png", dpi=320)
+    fig, ax = plt.subplots()
+    ax.plot(range(field_time+relax_time+1), magnetisation, "b.")
     plt.show()
+
