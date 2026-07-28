@@ -1,11 +1,41 @@
-# Refactor plan
+# Colour plan
 
-Rewrite `pysing` around an array-backed lattice with a correct (detailed-balance-satisfying)
-checkerboard heat-bath update, selectable boundary conditions, and reduced units.
+Extend `pysing` from the two-state Ising model to models whose state space *is* a colour space,
+so that the pictures are a direct rendering of the microstate rather than a false-colour map of
+±1.
 
-The **update rule itself is not changing** — `p(s_i = +1) = (1 + tanh(β(H + J·Σ_nn s_j)))/2`
-is already exactly heat-bath/Glauber. What changes is *when* it is applied, what the state is
-stored in, and how the parameters are expressed. See `method.md` for the physics-level diff.
+The organising idea is that the existing `Model` splits cleanly into two halves — **lattice
+geometry plus update schedule**, which every model on this list shares verbatim, and **the site
+alphabet plus its conditional distribution**, which is different in every case and shares no
+code at all. Everything below follows from taking that split seriously: extract the first half,
+reimplement the second half per model, and resist the urge to unify the conditionals.
+
+The primary target is the **q-state clock model**, whose state space is literally the hue wheel:
+`θ_k = 2πk/q` maps to hue with no design decision, and states that are close in energy are close
+in colour. It also happens to have the best test story of anything here, with three independent
+exact checkpoints (§5.5).
+
+---
+
+## Scope
+
+| Item | Status | Why |
+|---|---|---|
+| §1 `Lattice` extraction | **GO** | the shared half; everything else depends on it |
+| §2 `sample_categorical` | **GO** | shared by clock, Potts, and any discrete model |
+| §3 Oklch palettes | **GO** | this is what makes the figures pop rather than look like clip art |
+| §4 Clock model, heat bath | **GO** | primary deliverable |
+| §5 Potts | **SKETCH** | written up, not built; clock subsumes most of the interest |
+| §6 XY | **GO (phase 3)** | clock at q→∞; numpy samples the conditional natively |
+| §7 Heisenberg, Metropolis | **GO (phase 4)** | n=3; simplest sampler first, exact one deferred |
+| §8 Observables | **GO** | per model, as each lands |
+| §9 Tests | **GO** | gates every phase |
+| §10 Static figures | **GO** | the deliverable for now |
+| §11 Animation | **DEFERRED** | planned only; static figures first |
+| §12 Everything else | **DEFERRED** | clusters, over-relaxation, exact O(3), Ashkin–Teller |
+
+"SKETCH" means the design is recorded here in enough detail to build from, and deliberately not
+built. "DEFERRED" means not now, with the reason recorded so the decision is revisitable.
 
 ---
 
@@ -13,356 +43,541 @@ stored in, and how the parameters are expressed. See `method.md` for the physics
 
 | File | Status | Notes |
 |---|---|---|
-| `model.py` | rewritten | `Model` becomes array-backed; `Spin` dependency gone |
-| `run.py` | updated | reduced units, per-spin magnetisation, seeded |
-| `test_model.py` | **new** | pytest suite, see §10 |
-| `pytest.ini` | **new** | register the `slow` marker; nothing else |
-| `requirements-dev.txt` | **new** | `pytest` only — kept out of `requirements.txt` so the README's install flow stays minimal for people who just want to run the model |
-| `method.md` | new | approach comparison |
-| `README.md` | touched | document the `boundary` argument, link `method.md`, note how to run tests |
-| `spin.py` | **deleted** | see Appendix A |
-| `prelude.py` | **deleted** | see Appendix A |
+| `lattice.py` | **new** | `Lattice`: geometry, boundary, checkerboard, `neighbour_sum` |
+| `sampling.py` | **new** | `sample_categorical` and nothing else |
+| `palette.py` | **new** | Oklch → sRGB, equal-luminance hue rings |
+| `clock.py` | **new** | `ClockModel` |
+| `spinvector.py` | new, phase 3 | `VectorModel` base: unit-vector state, energy, order parameter |
+| `xy.py` | new, phase 3 | `XYModel(VectorModel)` |
+| `heisenberg.py` | new, phase 4 | `HeisenbergModel(VectorModel)` |
+| `potts.py` | *not written* | §5 is the design; build only if the δ-coupling is wanted for itself |
+| `model.py` | **touched** | `Model` delegates to `Lattice`; public API byte-identical |
+| `test_model.py` | **untouched** | all 30 tests must still pass — that is the refactor's acceptance criterion |
+| `test_lattice.py`, `test_clock.py`, `test_palette.py` | **new** | §9 |
+| `run.py` | touched | multi-panel static figures, §10 |
 
 ---
 
-## 1. Replace the `Spin` object graph with an `(L, L)` array
+## 1. Extract `Lattice` — the shared geometry
 
-**Problem.** `Model.spins` is a flat `ndarray` of 90 000 `Spin` instances, each holding an
-*object-dtype* `ndarray` of neighbour references (`spin.py:26`) — numpy's per-element overhead
-with none of its vectorisation. One `evolve()` at L=100 costs 103 ms across 128 k function calls;
-`Spin.nn_sum` alone is 42 ms of generator machinery over boxed Python floats.
+**Problem.** `Model` currently owns the boundary logic, the halo buffer and the checkerboard
+masks. Three more models need all three, and the periodic halo fill is exactly the kind of
+four-line block where a copy-pasted bug would live undetected.
 
-**Change.** `self.spins` becomes a single `np.ndarray` of shape `(L, L)`, `dtype=np.int8`,
-values ±1. Row-major indexing `[row, col]` matches the current flat convention `i = row*L + col`,
-so `plot` and any saved data stay consistent.
+**Design.** A `Lattice` owns geometry and knows nothing about spins. `Model` *holds* one and
+delegates, so its public surface does not change.
 
 ```python
-self.spins = self.rng.choice(np.array([-1, 1], dtype=np.int8), size=(L, L))
+class Lattice:
+    """Square lattice geometry: boundary handling, neighbour sums, checkerboard colouring.
+
+    Knows nothing about what lives on the sites. `neighbour_sum` works on any
+    `(..., L, L)` array, so a scalar Ising spin, a `(2, L, L)` clock vector and a
+    `(q, L, L)` one-hot occupancy all use the same code path.
+    """
+    def __init__(self, lattice_length: int, boundary: str = "open"):
+        # validation moves here verbatim from Model.__init__: L >= 1, boundary in
+        # BOUNDARIES, and for periodic L >= 3 and even (bipartiteness).
+        ...
+        rows, cols = np.indices((lattice_length, lattice_length))
+        self.black = (rows + cols) % 2 == 0
+        self.white = ~self.black
+        self._pads = {}
+
+    @property
+    def sublattices(self):
+        """The two halves, in update order. Every model's `evolve` loops over this."""
+        return (self.black, self.white)
+
+    def _pad_for(self, field):
+        """Halo buffer matching `field`'s leading shape and dtype, allocated once each."""
+        key = (field.shape[:-2], field.dtype)
+        if key not in self._pads:
+            L = self.lattice_length
+            self._pads[key] = np.zeros(field.shape[:-2] + (L + 2, L + 2), field.dtype)
+        return self._pads[key]
+
+    def neighbour_sum(self, field):
+        pad = self._pad_for(field)
+        pad[..., 1:-1, 1:-1] = field
+        if self.boundary == "periodic":
+            pad[..., 0, 1:-1] = field[..., -1, :]
+            pad[..., -1, 1:-1] = field[..., 0, :]
+            pad[..., 1:-1, 0] = field[..., :, -1]
+            pad[..., 1:-1, -1] = field[..., :, 0]
+        return (pad[..., :-2, 1:-1] + pad[..., 2:, 1:-1]
+                + pad[..., 1:-1, :-2] + pad[..., 1:-1, 2:])
 ```
 
-**Consequence.** `magnetisation` becomes `int(self.spins.sum(dtype=np.int64))`;
-`plot` no longer needs the `(spin.value + 1) / 2` list comprehension or the `.reshape`.
+Points of care:
 
-**Expected result:** ~54× at L=300 (452 ms/step → 8.3 ms/step, measured against a prototype).
+- **The open-boundary halo must stay zero across calls.** Writing `pad[..., 1:-1, 1:-1]` never
+  touches the halo, and `boundary` is fixed for the lifetime of a `Lattice`, so a zeroed buffer
+  stays zeroed. Keep the existing comment to that effect — it is the invariant the whole
+  one-code-path trick rests on.
+- **Caching by `(leading shape, dtype)`** rather than allocating once in `__init__`, because a
+  single `Lattice` may be asked for `(L,L) int8` and `(2,L,L) float64` sums by different callers.
+- **dtype is the caller's problem.** `int8` holds Ising sums (range [-4,4]) and Potts one-hot
+  counts (range [0,4]); the vector models pass float64. No promotion happens inside.
+- `(L, L)` sublattice masks broadcast correctly against `(C, L, L)` state in
+  `np.copyto(dst, src, where=mask)` — verified.
+
+**`Model` after the change.** `_neighbour_sum` becomes `return self.lattice.neighbour_sum(self.spins)`;
+`_black`/`_white` become properties forwarding to the lattice, or the `evolve` loop reads
+`self.lattice.sublattices` directly. `lattice_length` and `boundary` stay as forwarding
+properties so nothing downstream notices. **Acceptance criterion: `test_model.py` passes
+unmodified.**
 
 ---
 
-## 2. Neighbour sums via a padded halo — one code path for both boundary conditions
+## 2. `sample_categorical` — the shared discrete sampler
 
-**Problem.** `define_nn_pairs` (`model.py:130-209`) is 80 lines of hand-unrolled corner/edge
-casework. It is correct (I verified it, including L=2), but it hardcodes open boundaries and
-crashes with `IndexError` for `lattice_length=0`.
-
-**Change.** A single private method builds a zero-padded `(L+2, L+2)` buffer and takes four
-shifted slices. The boundary condition is *only* how the halo is filled:
+The one piece of *sampling* code that genuinely is shared, between the clock model, Potts, and
+any future multi-state model.
 
 ```python
-def _neighbour_sum(self) -> np.ndarray:
-    """Sum of the four nearest-neighbour spins, per site."""
-    pad = self._pad                      # cached (L+2, L+2) int8 buffer
-    pad[1:-1, 1:-1] = self.spins
-    if self.boundary == "periodic":
-        pad[0, 1:-1]  = self.spins[-1, :]
-        pad[-1, 1:-1] = self.spins[0, :]
-        pad[1:-1, 0]  = self.spins[:, -1]
-        pad[1:-1, -1] = self.spins[:, 0]
-    # halo corners are never read
-    return pad[:-2, 1:-1] + pad[2:, 1:-1] + pad[1:-1, :-2] + pad[1:-1, 2:]
+def sample_categorical(log_weights, rng):
+    """Draw one label per site from `(q, L, L)` unnormalised log-weights.
+
+    Returns `(L, L)` labels in `0..q-1`. The max-subtraction is the same log-space
+    discipline as `Model.log_weight`: the weights are exponentials of energies and
+    overflow at low temperature if formed directly.
+    """
+    lw = log_weights - log_weights.max(axis=0, keepdims=True)
+    cdf = np.cumsum(np.exp(lw), axis=0)
+    return (cdf < rng.random(cdf.shape[1:]) * cdf[-1]).sum(axis=0)
 ```
 
-Open BC = zero halo, so absent neighbours contribute 0 — **identical** to the current
-topology, not an approximation of it. Values stay in [-4, 4], so `int8` does not overflow.
-The buffer is allocated once in `__init__` (`self._pad`) and reused, so `_neighbour_sum` does
-no allocation beyond the returned array.
+This has already been checked at q=8: it reproduces the independent per-channel
+`½(1 + tanh(β(H + JΣ)))` conditional to a maximum absolute difference of **4.4e-16**. That is
+the guarantee that the categorical route is a strict generalisation of the current `evolve`
+rather than a parallel implementation that might drift from it.
+
+Cost is O(q) per site. `np.cumsum` plus a comparison beats `searchsorted` here because the
+weights differ per site, so there is no shared table to search.
 
 ---
 
-## 3. Boundary conditions as a constructor option
+## 3. Palettes — making the colour pop
 
-**Change.** `Model(..., boundary: str = "open")`, accepting `"open"` or `"periodic"`.
-Stored as `self.boundary`; validated in `__init__`.
+The difference between "pretty" and "clip art" is almost entirely whether the colours are
+**equal in perceptual lightness**. `tab10`, `Set1` and friends are not: their yellow reads as
+foreground and their blue as background, so a viewer sees structure that is an artifact of the
+palette rather than of the physics. sRGB's own luminance weights (0.2126 R, 0.7152 G, 0.0722 B)
+show how severe the imbalance is — pure blue carries a fourteenth of the luminance of pure green.
 
-**Validation rules (both must raise `ValueError` with an explanatory message):**
+**Design.** A `palette.py` exposing a hue ring at fixed Oklch lightness and chroma:
 
-- `boundary` not in `{"open", "periodic"}`.
-- `boundary == "periodic"` **and `L` odd** — with wraparound the lattice is no longer bipartite
-  (the wrap closes odd-length cycles), so the checkerboard update in §4 would no longer be exact.
-  This is a real constraint, not a convenience; it must be enforced rather than documented.
-- `boundary == "periodic"` **and `L < 3`** — at L=2 a site's left and right neighbours are the
-  same site, so each bond is counted twice and the energy is wrong. Standard PBC degeneracy.
-- `lattice_length < 1` (fixes the `IndexError` at L=0).
+```python
+def oklch_ring(q, lightness=0.72, chroma=None, phase=0.0):
+    """`(q, 3)` sRGB array: q hues equally spaced round the Oklch circle at constant
+    lightness and chroma, so no state is visually privileged.
 
-Open BC has no parity or size restriction; it stays the default so existing behaviour is
-opt-out, not opt-in.
+    With `chroma=None`, pick the largest chroma that keeps *every* hue in gamut, so the
+    ring stays uniform instead of clipping the hues that happen to run out first.
+    """
+```
+
+- **Why Oklch and not HSL/HSV.** HSV's "value" is not lightness; a full-saturation HSV ring
+  swings wildly in perceived brightness. Oklab is designed so that equal `L` reads as equal
+  lightness, which is precisely the property wanted.
+- **Gamut.** At `L = 0.72` the maximum in-gamut chroma varies by hue (blues run out first).
+  Taking the per-hue maximum gives a lumpy ring; take the **minimum over hues** of the per-hue
+  maximum instead, found by bisection on "do all channels land in [0, 1]". Slightly duller, but
+  uniform, which matters more.
+- **Transform chain.** Oklch → Oklab (`a = C cos h`, `b = C sin h`) → LMS' → cube → LMS → linear
+  sRGB via Ottosson's matrices → sRGB gamma encode
+  (`x ≤ 0.0031308 ? 12.92x : 1.055 x^(1/2.4) − 0.055`). About twenty lines with two fixed 3×3
+  matrices. **Spot-check the coefficients against a reference implementation when writing them**
+  — they are transcribed constants and a transposed matrix would produce plausible-looking but
+  wrong colours.
+- **The clock model needs no palette lookup at all** in principle, since hue is continuous and
+  `θ` is the hue angle directly; but going through the same `oklch_ring` keeps lightness constant,
+  which the naive `hsv` colormap would not.
+- **Rendering** is then `ax.imshow(palette[labels])`, `(q,3)` indexed by `(L,L)` giving
+  `(L,L,3)` — verified.
+- Provide a **cyclic** variant for the clock/XY models (hue wraps, which is correct: state `q-1`
+  is adjacent to state `0`) and note that a *sequential* colormap would be wrong there, because
+  it would put a false seam in a system with no seam.
 
 ---
 
-## 4. Checkerboard update — the correctness fix
+## 4. The clock model — primary deliverable
 
-**Problem.** `evolve` (`model.py:249`) computes every probability from the state at the start of
-the step, then writes all spins, so each site reads stale neighbours. That is parallel ("Little")
-dynamics, which does not satisfy detailed balance with respect to the Ising Gibbs measure.
-Measured on a 4×4 lattice against exact enumeration of all 65 536 states (βJ = 0.35, H = 0):
-⟨|m|⟩ = 0.3496 versus the exact 0.4166 — a 16 % systematic error in the order parameter.
+$$E = -J\sum_{\langle ij\rangle}\cos(\theta_i - \theta_j) \;-\; \vec H\cdot\sum_i \hat n_i,
+\qquad \theta_k = \frac{2\pi k}{q},\quad \hat n_k = (\cos\theta_k, \sin\theta_k)$$
 
-**Change.** Colour the lattice by `(i + j) % 2`. Every black site's neighbours are all white, so
-an entire sublattice can be resampled simultaneously *and exactly* — it is a block Gibbs sampler
-and detailed balance holds. One `evolve()` = both sublattices = one full sweep.
+### 4.1 Why this one
+
+- The state space **is** the hue wheel, so the colour map is forced rather than chosen, and
+  energetically-similar states are perceptually-similar colours. Domain walls between adjacent
+  hues are soft; between opposite hues, hard. That reads correctly without any tuning.
+- Three distinct visual regimes from one model. For `q ≥ 5` the 2D clock model has **two**
+  BKT transitions: low `T` locks to `q` discrete colours, an intermediate quasi-long-range-ordered
+  phase gives smooth hue swirls with visible vortices, high `T` is noise.
+- Best test story on this list — see §4.5.
+
+### 4.2 State and the local field
+
+Store **labels**, `(L, L) uint8`, not angles: the state space is discrete and labels keep it
+exactly so. Angles are derived on demand through a length-`q` lookup table.
+
+The key move, which is what makes this reuse the existing machinery rather than sit beside it:
+since `cos(θ_i − θ_j) = n̂_i · n̂_j`, the local field is a **2-vector**,
+
+$$\vec h_i = \vec H + J\sum_{nn}\hat n_j$$
+
+and the conditional is `p(k) ∝ exp(β h⃗_i · n̂_k)`. That is the same "dot the local field with the
+candidate state" shape as Ising's `tanh`, with a two-component field and `q` candidates instead
+of a one-component field and two candidates.
+
+```python
+class ClockModel:
+    def __init__(self, lattice_length, q=6, temperature=1.0, field=(0., 0.),
+                 coupling=1.0, boundary="open", init="hot", seed=None):
+        ...
+        theta = 2 * np.pi * np.arange(q) / q
+        self._unit = np.stack([np.cos(theta), np.sin(theta)])      # (2, q)
+
+    def _vectors(self):
+        return self._unit[:, self.labels]                          # (2, L, L)
+
+    def _local_field(self):
+        return self.H[:, None, None] + self.J * self.lattice.neighbour_sum(self._vectors())
+
+    def evolve(self):
+        for sublattice in self.lattice.sublattices:
+            lw = self.beta * np.einsum("ck,cij->kij", self._unit, self._local_field())
+            new = sample_categorical(lw, self.rng)                 # (L, L)
+            np.copyto(self.labels, new, where=sublattice)
+    ```
+
+`_local_field` must be recomputed inside the loop, for the same reason as in `Model.evolve`: the
+second sublattice has to see the freshly updated first one.
+
+### 4.3 Energy and order parameter
+
+Both keep the shape of the Ising versions, with the scalar product replaced by a dot product:
+
+```python
+@property
+def energy(self):
+    n = self._vectors()
+    bond = (n * self.lattice.neighbour_sum(n)).sum()      # each bond counted twice
+    return -0.5 * self.J * float(bond) - float(self.H @ n.sum(axis=(1, 2)))
+
+@property
+def magnetisation_per_spin(self):
+    """The order parameter is a 2-vector; `|m|` is the scalar to plot."""
+    return self._vectors().mean(axis=(1, 2))              # (2,)
+```
+
+`magnetisation` returning a `(2,)` array rather than an `int` is a deliberate break from `Model`
+— these are different classes, not a subtype relationship, precisely so that this can differ.
+
+### 4.4 The field argument
+
+`field` becomes a 2-vector, which both biases a direction and *breaks the `Z_q` symmetry*.
+Worth exposing because at `H = 0` the low-temperature state picks one of `q` colours at random,
+which makes a multi-panel figure look arbitrary; a small field pins it and makes panels
+comparable.
+
+### 4.5 Exact checkpoints — why the test story is good
+
+| q | Equivalent to | Relation |
+|---|---|---|
+| 2 | **Ising, same J** | `θ ∈ {0, π}` ⇒ `cos(θ_i − θ_j) = σ_i σ_j` exactly. No coupling rescale. |
+| 3 | 3-state Potts | `cos Δθ ∈ {1, −½}`, an affine map of `δ`: `cos = (3δ − 1)/2`, giving `E_clock = 1.5·E_Potts + N_bonds/2` (the constant is not optional — a test must encode it) |
+| 4 | **two decoupled Ising models at `J/2`** | rotate 45°: `n̂ = (σ, τ)/√2` ⇒ `n̂_i·n̂_j = ½(σ_iσ_j + τ_iτ_j)` ⇒ `β_c J = 2 × 0.4407 = 0.8814` |
+| ≥5 | — | two BKT transitions |
+| ∞ | XY | single BKT at `β_c J ≈ 1.1199` |
+
+The `q = 2` case is an *identity*, not an approximation: `ClockModel(q=2)` and `Model` must
+produce the same conditional distribution at the same `J`. That is a far stronger regression
+test than anything statistical.
+
+The `q = 4` case is the "decoupled channels" observation from the RGB discussion reappearing —
+a model that looks like it has four coupled states is two independent Ising models wearing a
+hat. Nice to have it fall out as an exact test rather than a remark.
+
+---
+
+## 5. Potts — sketch only
+
+$$E = -J\sum_{\langle ij\rangle}\delta(s_i, s_j)$$
+
+Recorded because it is a small delta from the clock model and may be wanted for its own sake
+(hard-edged colour blocks, and first-order behaviour that clock does not have).
+
+**Difference from clock.** Only `_local_field` and the log-weights change. The neighbour
+"field" becomes a one-hot occupancy count:
+
+```python
+def _counts(self):
+    """`(q, L, L)`: how many neighbours are in each state."""
+    onehot = (self.labels[None, :, :] == np.arange(self.q)[:, None, None])
+    return self.lattice.neighbour_sum(onehot.astype(np.int8))
+
+def evolve(self):
+    for sublattice in self.lattice.sublattices:
+        lw = self.beta * (self.J * self._counts() + self.H[:, None, None])
+        np.copyto(self.labels, sample_categorical(lw, self.rng), where=sublattice)
+```
+
+Note that one-hot encoding makes the **existing stencil work unchanged**, and that open
+boundaries then mean "the absent neighbour is in no state at all", which is exactly right with a
+zero halo. No boundary special-casing.
+
+**What Potts has that clock does not.**
+
+- **Exact critical point for every q** by self-duality: `β_c J = ln(1 + √q)`.
+- **Transition order changes with q**: continuous for `q ≤ 4`, **first-order for `q ≥ 5`**. That
+  buys phase coexistence, metastable droplets, and hysteresis between hot and cold starts — the
+  most dramatic pictures available anywhere in this plan.
+- A **bimodal energy histogram** at `T_c` for `q ≥ 5`: a plot that is simultaneously pretty and a
+  direct measurement of first-order character.
+
+**What it costs.** The colour map is arbitrary again (states have no ordering, so any assignment
+of `q` hues is as good as any other), and equilibrating a first-order transition properly needs
+multicanonical/Wang–Landau sampling, which is a much larger project than anything else here.
+
+**Order parameter**, since magnetisation does not survive: `m = (q·max_k ρ_k − 1)/(q − 1)` with
+`ρ_k` the population fraction, running 0 (disordered) to 1 (ordered) for any q.
+
+**Field** generalises to a `q`-vector `H_k` biasing each state; `H_k = H δ_{k0}` recovers the
+usual symmetry-breaking field.
+
+---
+
+## 6. XY — clock at q → ∞
+
+$$E = -J\sum_{\langle ij\rangle}\cos(\theta_i - \theta_j) - \vec H\cdot\sum_i\hat n_i,
+\qquad \theta_i \in [0, 2\pi)$$
+
+**Everything in §4 carries over except the sampler.** `_local_field` is unchanged; the state
+becomes `(L, L) float64` angles, or equivalently `(2, L, L)` unit vectors.
+
+**The conditional is exactly von Mises.** With `h⃗` the local field, `φ = atan2(h_y, h_x)` and
+`a = β|h⃗|`,
+
+$$p(\theta) \propto e^{\beta \vec h\cdot\hat n(\theta)} = e^{a\cos(\theta - \varphi)}$$
+
+which is the von Mises distribution with mean `φ` and concentration `a` — **and numpy samples it
+natively**. The entire exact heat-bath update is:
 
 ```python
 def evolve(self):
-    """One sweep: resample each sublattice in turn from its exact conditional."""
-    beta = self.beta
-    for sublattice in (self._black, self._white):
-        h = beta * (self.H + self.J * self._neighbour_sum())
-        p = 0.5 * (1.0 + np.tanh(h))
-        new = np.where(self.rng.random(p.shape) < p, np.int8(1), np.int8(-1))
-        np.copyto(self.spins, new, where=sublattice)
+    for sublattice in self.lattice.sublattices:
+        h = self._local_field()
+        new = self.rng.vonmises(np.arctan2(h[1], h[0]), self.beta * np.hypot(*h))
+        np.copyto(self.theta, new, where=sublattice)
 ```
 
-`self._black = (i + j) % 2 == 0` and `self._white = ~self._black` are built once in `__init__`
-via `np.indices`.
+This is *less* code than a Metropolis update and it is exact, so XY should use it rather than
+the Metropolis route recommended for Heisenberg. `rng.vonmises` returns angles in `(−π, π]`;
+wrap consistently with however `_vectors` is written (it doesn't matter for `cos`/`sin`, only
+for plotting the raw angle).
 
-**Delete the `random() > 0.2` damping.** It was suppressing the checkerboard blinking caused by
-synchronous updates; with sublattice updates the oscillation cannot occur, so the hack is not
-just unnecessary, it is a second source of bias.
-
-**Known inefficiency, deliberately accepted:** `h` and the random field are computed over the
-full lattice each half-sweep and then half-discarded, so the sweep does 2× the strictly necessary
-`tanh` and RNG work. Avoiding it needs boolean fancy-indexing, which in practice costs more than
-the wasted vectorised work at these sizes. Noted here so it is a choice, not an oversight.
+**Physics worth showing.** A genuine BKT transition at `β_c J ≈ 1.1199` (`T_c ≈ 0.893 J`), and
+**vortices** — points where all hues meet in a pinwheel. They are strikingly visible under a
+cyclic hue map and are the single best argument for this whole colour project. Detect them by
+summing the wrapped phase difference round each unit plaquette; the result is `2π` times the
+winding number, so a `(L, L)` integer array of `−1/0/+1` marks antivortices, nothing, vortices.
+Overplot as scatter points on the hue field.
 
 ---
 
-## 5. Fold `probability_gradient` into the update
+## 7. Heisenberg — Metropolis, n = 3
 
-**Problem.** `probability_gradient` (`model.py:92`) is documented as a gradient of the Boltzmann
-numerator with the common factor `p` dropped. The maths is right, but the framing is a detour:
-passed through `tanh` the quantity is just β times the local field, and the result is the exact
-heat-bath conditional. Dropping `p` is also *required*, not merely convenient — keeping it would
-overflow exactly as `z_prob` does (§7).
+$$E = -J\sum_{\langle ij\rangle}\vec S_i\cdot\vec S_j - \vec H\cdot\sum_i\vec S_i,
+\qquad |\vec S_i| = 1$$
 
-**Change.** Remove the public property. The local field becomes a private helper used by
-`evolve` and, if wanted, by observables:
+**State layout `(3, L, L)` float64**, not `(L, L, 3)`: it matches the verified broadcast pattern
+against the `(L, L)` sublattice masks, and lets the stencil run per-component untouched.
+
+**Sampler: Gaussian-perturbation Metropolis**, as recommended — frame-free, no special functions,
+no orthonormal-basis construction.
 
 ```python
-def _local_field(self) -> np.ndarray:
-    """H + J·Σ_nn s_j at every site (an energy, not a gradient)."""
-    return self.H + self.J * self._neighbour_sum()
+def evolve(self):
+    for sublattice in self.lattice.sublattices:
+        h = self.H[:, None, None] + self.J * self.lattice.neighbour_sum(self.spins)
+        trial = self.spins + self.step * self.rng.normal(size=self.spins.shape)
+        trial /= np.linalg.norm(trial, axis=0, keepdims=True)
+        dE = -(h * (trial - self.spins)).sum(axis=0)
+        # exp(-beta * max(dE, 0)) is 1 for downhill moves, so they are always accepted,
+        # and the exponential never overflows.
+        accept = self.rng.random(dE.shape) < np.exp(-self.beta * np.maximum(dE, 0.0))
+        np.copyto(self.spins, trial, where=sublattice & accept)
 ```
 
-`evolution_probs` is likewise absorbed; if a public hook is still wanted for plotting, expose
-`heat_bath_probs` with a docstring that names the rule correctly.
+Three things to get right:
+
+- **The proposal is symmetric, so plain Metropolis is valid** (no Hastings ratio). `S' =
+  normalise(S + εg)` with isotropic Gaussian `g` is rotationally covariant, so `q(S'|S)` depends
+  only on `S·S'`, which is symmetric under exchange. Worth stating explicitly in the docstring —
+  a non-symmetric proposal used with a bare Metropolis test is exactly the kind of error that
+  produces plausible pictures and wrong physics.
+- **`step` needs tuning** to roughly 50% acceptance, and acceptance is temperature-dependent.
+  Expose it as a constructor argument and expose the running acceptance rate as a property, so
+  it is at least visible; automatic tuning during burn-in breaks detailed balance and must not
+  be done during measurement.
+- **Renormalise defensively.** Floating-point drift in `|S| = 1` accumulates over long runs;
+  `_check_state` should assert `|S| = 1` to `~1e-12` and the state should be renormalised
+  wholesale if it ever drifts.
+
+**Two honest limitations, to be documented rather than worked around.**
+
+1. **Mermin–Wagner**: continuous symmetry, 2D, short-range interactions ⇒ no spontaneous
+   magnetisation at any `T > 0`, and **no finite-temperature transition at all**. The correlation
+   length grows exponentially as `T → 0`, so low-`T` pictures still show large smooth swirls, but
+   nothing critical can be demonstrated. `critical_temperature` must **raise**, not return a
+   number.
+2. **S² does not map to colour.** A 3-component unit vector needs two angles, and there is no way
+   to lay a sphere on a perceptually uniform colour space without a seam or a degeneracy. Two
+   options, both compromised, both worth offering:
+   - `(S⃗ + 1)/2` as raw sRGB — lands on the sphere inscribed in the RGB cube, so *the spin is the
+     colour*, no palette at all. Honest and elegant; half of it is dark and lightness varies
+     wildly.
+   - Hue = azimuth, chroma ∝ `sin θ`, lightness fixed — perceptually much better, but sends both
+     poles to grey, so the two *most opposed* states render identically.
+
+   Ship the first as default, offer the second, and say plainly in the docstring that the
+   ambiguity is geometric and not a rendering bug.
+
+**`spinvector.py`.** XY and Heisenberg share unit-vector state, `_local_field`, `energy`, and the
+vector order parameter; they differ only in `n`, the sampler, and the colour map. A small
+`VectorModel` base carrying the shared four is justified. It is *not* justified to extend that
+base to cover the clock model — clock stores labels, and forcing it into a vector representation
+would lose the exactness of the discrete state space for no gain.
 
 ---
 
-## 6. Reduced units: set `k_B = 1`
+## 8. Observables
 
-**Problem.** `temperature=7.2429705e+22` chosen against a hardcoded `k_b = 1.380649e-23`
-(`model.py:78`) so that β ≈ 1. Only the dimensionless combinations βJ and βH carry physics.
-This is the blocker for the "recast this in terms of T, not J" commit.
+| Quantity | Ising | Clock / XY | Potts | Heisenberg |
+|---|---|---|---|---|
+| order parameter | `Σs/N` | `\|Σ n̂/N\|` | `(q·max ρ_k − 1)/(q−1)` | `\|Σ S⃗/N\|` (→0 always) |
+| energy per spin | as now | as now, dot product | δ-count | dot product |
+| critical point | Onsager 2.269 J | q=2,4 exact; else BKT | `ln(1+√q)` | **raises** |
+| special | — | vortex winding number (§6) | bimodal `E` histogram, q≥5 | — |
 
-**Change.**
-
-- Delete `inverse_temp` and the `k_b` constant. Add `beta` → `1.0 / self.T`.
-- New signature: `Model(lattice_length, temperature=2.0, field=0.0, coupling=1.0, ...)`,
-  i.e. J is the energy unit and T is measured in units of J/k_B.
-- Add read-only convenience properties `beta_J` (`self.J / self.T`) and `beta_H`.
-- Guard `T <= 0` with a `ValueError` (β = ∞ is not representable and `tanh` would give a
-  zero-temperature quench, which deserves its own code path if ever wanted).
-
-`T`, `H`, `J` stay plain mutable attributes so `run.py`'s mid-run `m.H = 0` keeps working;
-`beta` and friends are derived properties, never cached.
+The vortex winding number is the one worth building early: it is cheap, it is a genuine
+topological observable, and it turns the XY figure from "nice texture" into "here is the defect
+structure that drives the transition".
 
 ---
 
-## 7. `z_prob` → `log_weight`
+## 9. Tests
 
-**Problem.** `z_prob` (`model.py:82`) returns `inf` for anything above a toy lattice — at L=100
-it overflows silently but for a `RuntimeWarning` (βE ≈ −15 000). It is unusable as written.
+Following the existing suite's structure: exact tests first, statistical tests marked `slow`.
 
-**Change.** Replace with
+**9a. Refactor guard (gates everything).**
+- `test_model.py` passes **unmodified**. Non-negotiable.
+- `Lattice.neighbour_sum` on `(L,L) int8` matches the pre-refactor `Model._neighbour_sum`
+  element-for-element, both boundaries, several `L`. Capture the golden values *before* the
+  refactor lands, exactly as `test_open_bc_topology_unchanged` did for the last one.
 
-```python
-@property
-def log_weight(self) -> float:
-    """log of the unnormalised Boltzmann weight, −βE. Use differences, never exp() of this."""
-    return -self.beta * self.energy
-```
+**9b. Shared sampler.**
+- `sample_categorical` with equal weights is uniform (chi-square, `slow`).
+- With known unequal weights, empirical frequencies match (chi-square, `slow`).
+- Degenerate `q = 1` returns all zeros; extreme log-weights (`±700`) do not overflow or NaN.
 
-Docstring states explicitly that any ratio of weights must be formed from ΔE, and that the
-sampler itself never needs this quantity.
+**9c. Clock — the exact checkpoints of §4.5.**
+- `q = 2` conditional probabilities equal `Model.heat_bath_probs()` at the same `J`, to machine
+  precision, on random states, both boundaries. *The strongest test in the suite.*
+- `q = 4` energy equals the sum of two Ising energies at `J/2` under the 45° relabelling, on
+  random states.
+- `q = 3` energy satisfies `E_clock = 1.5·E_Potts + N_bonds/2`.
 
----
+All three of these have been checked numerically on random 6×6 states and hold to float
+precision, so they are known-good before a line of the implementation exists.
+- Exact enumeration on a 2×2 open lattice at `q = 3` (81 states) — sampled distribution matches
+  Boltzmann weights; and the half-sweep transition matrix is reversible w.r.t. the Boltzmann
+  distribution, generalising `test_half_sweep_is_reversible`.
+- `β → 0` gives a uniform label histogram; `β → ∞` with a field pins every site to the nearest
+  state to `H⃗`.
 
-## 8. `critical_temp` → `reduced_temperature`
+**9d. Palette.**
+- Every entry in `[0, 1]` and in gamut for all `q` in `2..16`.
+- Round-tripping the ring back through the forward Oklab transform gives constant `L` to `~1e-6`
+  — this is the property being claimed, so it should be the property tested.
+- Hues are distinct and evenly spaced; the ring is cyclic (entry `q−1` adjacent to `0`).
 
-**Problem.** `critical_temp` (`model.py:31`) is named as a temperature but returns the
-dimensionless ratio T/T_c. (The constant 0.440687 = ln(1+√2)/2 is correct.)
+**9e. Continuous models.**
+- `|S| = 1` invariant holds to `1e-12` after many sweeps (both XY and Heisenberg).
+- **Single spin in a field**: `L = 1`, no neighbours ⇒ `⟨S_z⟩ = coth(βH) − 1/(βH)` exactly
+  (the Langevin function) for Heisenberg, and `I₁(βH)/I₀(βH)` for XY. Closed-form, decisive,
+  `slow`.
+- High `T` is uniform on the sphere/circle: mean → 0, and `cos θ` flat for n=3.
+- Heisenberg proposal symmetry, numerically: histogram `S·S'` from `S → S'` and from `S' → S`
+  and check they agree.
+- XY: the `q → ∞` limit of `ClockModel` reproduces `XYModel` energy statistics at large `q`
+  (`q = 64` should be indistinguishable), `slow`.
 
-**Change.** Rename to `reduced_temperature`, returning `T / T_c` with
-`T_c = 2 J / ln(1 + √2)` exposed as a separate `critical_temperature` property so the name
-finally means what it says. Docstring must state the three conditions under which Onsager's
-result applies: infinite lattice, zero field, periodic boundaries — none of which strictly hold
-here, so it is a guide to where you are in parameter space, not a prediction.
-
-Guard `J == 0` (division by zero).
-
----
-
-## 9. Observables, RNG, annotations, plotting
-
-**9a. Per-spin observables.** `run.py` currently plots raw sums up to ±90 000. Keep
-`magnetisation` and `energy` extensive (that is what the words mean), and add
-`magnetisation_per_spin` and `energy_per_spin`. `run.py` plots the per-spin quantity.
-
-**9b. Vectorised `energy`.** Each bond appears twice in `Σ_i s_i · nn_sum_i`, so:
-
-```python
-@property
-def energy(self) -> float:
-    bond_sum = (self.spins * self._neighbour_sum()).sum(dtype=np.int64)
-    return -0.5 * self.J * float(bond_sum) - self.H * self.magnetisation
-```
-
-Correct for open BC (zero halo contributes nothing) and for periodic BC at L ≥ 3.
-
-**9c. Seeded RNG.** Drop `from random import choice, choices, random` entirely. `Model` takes
-`seed: int | None = None` and holds `self.rng = np.random.default_rng(seed)`, used for both the
-initial state and every update. `run.py` passes a fixed seed.
-
-**9d. Annotations.** Replace `np.float64` with `float` on every scalar parameter and return
-(the values are Python floats, and `sum()` of Python floats was never an `np.float64` anyway).
-Drop the now-unused `from typing import Tuple, Iterator` and `from itertools import pairwise`.
-
-**9e. Direct-assignment validation.** `Spin.__init__` asserted `value in (1., -1.)` but
-`model.py:257` bypassed it. With an `int8` array the invariant is structural; add a
-`_check_state()` helper used only by the tests rather than a runtime guard on the hot path.
-
-**9f. Plotting.** `plot` currently duplicates `plot_to_axes` and hardcodes `dpi=320`
-(`example.png` is 1.3 MB). Refactor so `plot` creates the figure and *delegates* to
-`plot_to_axes` — which turns a dead method into a live one and makes multi-panel figures like
-`example.png` easy again. Add a `dpi: int = 150` parameter. Title becomes `T`, `H`, `J` plus the
-boundary condition.
+Note explicitly in `method.md` that **the transition-matrix reversibility tests do not generalise
+to continuous spins** — XY and Heisenberg lose that safety net, which is exactly why the
+closed-form Langevin/Bessel checks matter more there than they would otherwise.
 
 ---
 
-## 10. Test suite (`pytest`)
+## 10. Static figures
 
-`pytest` is not currently in the venv — it goes in a new `requirements-dev.txt`, installed with
-`pip install -r requirements-dev.txt`. A three-line `pytest.ini` registers the `slow` marker so
-the fast suite is `pytest -m "not slow"` and the full one is plain `pytest`.
+`run.py` grows a small set of figure builders, each producing one multi-panel PNG. All static;
+no animation yet.
 
-**Ground rule:** every reference implementation in the test module is written independently of
-`model.py` — naive Python loops over explicit indices. A test that reuses `_neighbour_sum` to
-check `energy` proves nothing.
+1. **Clock temperature sweep**, `q = 6`, one panel per `T` spanning both BKT transitions —
+   locked colours, hue swirls, noise. The headline figure.
+2. **Clock q sweep** at fixed reduced temperature, `q = 2, 3, 4, 6, 12` — shows the crossover
+   from Ising-like blocks to continuous hue.
+3. **XY with vortices**, hue field with winding-number overplot at three temperatures.
+4. **Heisenberg**, both colour maps side by side at low `T`, honestly labelled, with the
+   Mermin–Wagner caveat in the caption.
 
-### 10a. Sampler correctness — the tests that justify the whole refactor
+Add an **`init` argument** (`"hot"` random, `"cold"` uniform) to every new model while building
+these. `Model` currently always hot-starts; cold-vs-hot from the same temperature is what
+*shows* hysteresis, and it is needed for equilibration checks regardless.
 
-| Test | What it asserts | How |
-|---|---|---|
-| `test_half_sweep_is_reversible` | Each sublattice update satisfies detailed balance, π(s)P(s→s′) = π(s′)P(s′→s) | 3×3 open lattice, 512 states. Build the 512×512 half-sweep transition matrix exactly (the sublattice update factorises over sites, so each entry is a product of per-site conditionals), and compare against the Boltzmann π. **Deterministic — no sampling noise, no tolerance beyond float error.** |
-| `test_full_sweep_is_stationary` | πP = π for the two-half-sweep composition | Same machinery. Note the composition of two reversible kernels is *not* generally reversible, so stationarity — not detailed balance — is the correct claim to assert here |
-| `test_matches_exact_enumeration` | Sampled ⟨\|m\|⟩ and ⟨E⟩ match brute force | 4×4, enumerate all 2¹⁶ states. Parametrised over (βJ, H) ∈ {(0.35, 0), (0.35, 0.2), (0.2, 0)} × {open, periodic}. The H ≠ 0 case matters: it breaks the ±s symmetry and is the only statistical check on the field term's sign. Marked `slow` |
+Each builder takes a seed and writes a named file, so figures are reproducible and regenerable.
 
-The first two are the real prize: they pin the exact property the original code violated, in
-milliseconds and without a tolerance. The enumeration test is the end-to-end backstop. Both
-would have caught the 16 % bias.
+---
 
-Exact transition matrices are only feasible for L ≤ 3 (512 states → a 512² matrix). Periodic
-mode needs even L ≥ 4, i.e. ≥ 65 536 states, so periodic is covered by the statistical test only.
+## 11. Animation — DEFERRED
 
-### 10b. Lattice geometry
+Planned, not built. Recorded now so the static-figure code does not accidentally foreclose it.
 
-| Test | What it asserts |
+- The natural interface is a `frames(model, n, stride)` generator yielding rendered `(L, L, 3)`
+  arrays; `plot_to_axes` already gives the per-frame render, so this is thin.
+- `matplotlib.animation.FuncAnimation` → GIF via `pillow`, or mp4 via `ffmpeg` (an external
+  binary, so it must not become a hard dependency — keep it out of `requirements.txt` the same
+  way `pytest` is).
+- The two sequences worth animating: clock-model **domain coarsening** after a quench, and XY
+  **vortex pair annihilation**.
+- Constraint on the static work: keep rendering (state → RGB array) separate from plotting
+  (RGB array → axes), so the animation path can reuse the first without the second.
+
+---
+
+## 12. Deferred, with reasons
+
+| Idea | Why deferred |
 |---|---|
-| `test_coordination_numbers` | `_neighbour_sum` on an all-up lattice reproduces the coordination number per site: open BC gives 2 at corners, 3 on edges, 4 inside; periodic gives 4 everywhere |
-| `test_neighbour_sum_against_reference` | Random states, both BCs, against a naive loop using explicit (and, for periodic, modular) index arithmetic |
-| `test_open_bc_topology_unchanged` | **Regression against the current code.** Golden neighbour sums for a fixed 5×5 state, captured from the *existing* `define_nn_pairs`/`Spin.nn_sum` before `spin.py` is deleted, hardcoded into the test. Guards against silently changing the geometry during the rewrite |
-| `test_sublattice_partition` | Black and white masks are complementary and cover the lattice, **and no two same-colour sites are neighbours** — checked by shifting the mask in all four directions under the active BC. This is the assumption the checkerboard update rests on, and the one that fails for odd L with periodic BC |
-
-### 10c. Analytic limits
-
-| Test | What it asserts |
-|---|---|
-| `test_zero_coupling_gives_tanh` | At J = 0 the sites are independent, so ⟨m⟩ = tanh(βH) exactly. Clean closed-form check of the field term and the ½(1+tanh) normalisation, with no lattice physics involved |
-| `test_saturating_field` | βH ≫ 1 drives every spin to +1 within one sweep; βH ≪ −1 to −1. Effectively deterministic |
-| `test_infinite_temperature_is_unbiased` | T → ∞ gives p = ½ per site, so \|m\| ~ O(N^(−1/2)); assert it sits inside a few standard errors |
-| `test_ordering_below_tc` | From a random start at T = 0.7 T_c, periodic BC, \|m\| per spin exceeds ~0.9 after enough sweeps; above T_c it stays small. Loose bounds — this is a smoke test for "the model does Ising things", not a measurement. Marked `slow` |
-
-### 10d. Observables and plumbing
-
-| Test | What it asserts |
-|---|---|
-| `test_energy_matches_bond_loop` | Vectorised `energy` against an explicit loop over bonds, both BCs, random states and fields |
-| `test_log_weight_finite_at_large_lattice` | **Regression for the `z_prob` overflow.** L=100 returns a finite `log_weight`, and `pytest.warns` records no `RuntimeWarning` |
-| `test_per_spin_observables` | `magnetisation_per_spin == magnetisation / N`, same for energy |
-| `test_reduced_temperature` | Equals 1.0 at T = T_c; scales as expected; raises on J = 0 |
-| `test_parameters_are_mutable_midrun` | Setting `m.H = 0` after construction changes `beta_H` — guards against anyone caching β or βH, which is what `run.py` depends on |
-| `test_state_invariants` | After many sweeps the array is still `int8` and every entry is ±1 |
-| `test_reproducible_with_seed` | Same seed → bit-identical trajectories; different seeds → different ones |
-| `test_constructor_validation` | Parametrised `pytest.raises(ValueError)`: odd L periodic, L < 3 periodic, unknown `boundary` string, T ≤ 0, L < 1 |
-| `test_plot_writes_file` | `matplotlib.use("Agg")`, `plot(filename=tmp_path/"x.png")` produces a non-empty file — cheap cover for the §9f plotting refactor |
-
-### 10e. Practicalities
-
-- **Tolerances** on the statistical tests will be calibrated from a pilot run with margin, not
-  guessed. Successive sweeps are autocorrelated, so the naive √N standard error understates the
-  true spread; I will size the tolerance from the observed scatter across seeds.
-- **Determinism.** Every stochastic test takes an explicit seed, so a pass is a pass. Where a
-  test is inherently statistical I will note the failure probability in a comment.
-- **Runtime budget:** `pytest -m "not slow"` under ~5 s; the full suite under ~60 s.
+| **Over-relaxation** for XY/Heisenberg — reflect `S⃗` through its local field, `S⃗ → 2(S⃗·h⃗)h⃗/\|h⃗\|² − S⃗`. Energy-conserving, deterministic, three vectorised lines, and interleaving it with the sampler dramatically cuts autocorrelation time. | Best effort-to-reward ratio on this list and *should be the first thing added after phase 4*. Deferred only because it is an accelerator, not a capability, and it needs a working sampler to interleave with. Comes with a perfect test: energy conserved to float tolerance. |
+| **Exact O(3) heat bath** for Heisenberg: `a = β\|h⃗\|`, azimuth uniform, `u = cos θ = 1 + ln[r + (1−r)e^{−2a}]/a` (written that way for low-`T` stability). Verified against the Langevin function to ~4 decimals over `a ∈ [0.1, 30]`. | Needs a per-site orthonormal basis aligned to `h⃗` (branchless: cross `ĥ` with `x̂`, or with `ẑ` where `\|h_x\|` is large) and an `a → 0` guard falling back to uniform-on-sphere. Metropolis first; this replaces it once the model is otherwise trusted. |
+| **Cluster algorithms** — Swendsen–Wang / Wolff for Potts and clock (Fortuin–Kasteleyn, bond probability `1 − e^{−βJ}`), embedded-Wolff for O(n) (project onto a random reflection plane, run Ising Wolff on the signs). | A real complexity jump: needs connected-component labelling (`scipy.sparse.csgraph`) or a BFS that numpy is bad at, and a new dependency. Worth knowing *before* designing it that **one cluster engine serves Ising, Potts, clock and O(n)** — design for that when the time comes. Needs the bond enumeration in Appendix A. |
+| **Multicanonical / Wang–Landau** for `q ≥ 5` Potts | Only needed to equilibrate a first-order transition properly. Much larger than anything else here, and unnecessary unless Potts is actually built. |
+| **Ashkin–Teller coupled RGB** — three Ising layers with a bond term `−K Σ_⟨ij⟩ Σ_{c<c'} s^c_i s^c_j s^{c'}_i s^{c'}_j`, measured to give cross-channel domain-wall coincidence with excess ratio 1.0 → 3.7 → 12.7 as `K` goes 0 → 0.15 → 0.30, and a Baxter phase where the composite orders while the individual channels do not. | Superseded by the clock model for the *colour* goal, but it is the more interesting *physics* of the two and the measurements are already done. The 8-state site conditional it needs is exactly `sample_categorical`, so §2 keeps the door open at zero cost. |
 
 ---
 
-## 11. `run.py`
+## Appendix A — bond enumeration
 
-- Parametrise in reduced units. To preserve the current demo's *dimensionless* parameters
-  exactly (βJ = 0.3, βH = 1.0): `J = 1.0`, `T = 10/3`, `H = 10/3`. That is T ≈ 1.47 T_c, i.e.
-  above criticality, which is consistent with the "relaxation after the field is removed" demo.
-- Plot `magnetisation_per_spin`; label axes; label the x-axis "sweeps".
-- Pass `seed`, and expose `boundary` as a top-level variable so both modes are one edit away.
+Carried over from the previous plan, unchanged; `method.md` references it for the cluster
+algorithms in §12.
 
-The plotted curve will not reproduce the old figure — the dynamics is being corrected and the
-time unit changes from "80 % of spins updated" to "one full sweep". That is expected and
-correct. I will keep the parameters faithful to the original dimensionless values and, if the
-resulting curve reads badly, adjust `field_time`/`relax_time` (the observation window) rather
-than the physics.
-
----
-
-## Appendix A — removed code: what it did, and how to restore the capability
-
-Nothing here is lost information; each item maps to a cheaper array-level equivalent. Recorded
-so that reintroducing any of it is a deliberate five-minute job rather than an archaeology
-exercise.
-
-### `spin.py` — the whole `Spin` class
-
-| Member | What it did | How to get it back |
-|---|---|---|
-| `value` | ±1 float, one per site | `model.spins[i, j]` (int8) |
-| `id`, `__repr__` | debugging identity, `spin-up@1234` | flat index `i*L + j`; add a `Model.describe(i, j)` helper if a printable form is wanted |
-| `initialised`, `initialise` | guarded against using a spin before its neighbours were wired up | no longer meaningful — neighbours are implicit in the array geometry, so the invalid state cannot be constructed |
-| `nearest_neighbours` | object-dtype array of neighbour `Spin`s | `_neighbour_sum()` gives the *sum*, which is all any Ising update needs. For the neighbour **identities** (e.g. to build clusters), generate index arrays with `np.indices` and the same four shifts |
-| `flip()` | invert one spin in place | `self.spins[i, j] *= -1`. **This is the primitive a Metropolis or Wolff implementation needs** — single-spin proposals and cluster flips both flip rather than resample. It was removed because heat-bath resamples (`np.where`) instead of flipping, not because flipping is wrong |
-| `nn_sum()` | sum over one site's neighbours | `_neighbour_sum()[i, j]`, or the four explicit lookups if only one site is needed |
-
-### `prelude.py` — `grid_pairs`
-
-A standalone duplicate of `Model.get_nn_pairs` operating on a flat array of indices, with a
-`__main__` block printing the pairs for a 3×3 grid. It was a scratchpad for working out the
-bond ordering. Imported nowhere. The bond enumeration it encodes is preserved in the slice
-shifts of `_neighbour_sum`; if a printable list of bonds is ever wanted again, it is
-`np.stack(np.indices((L, L)))` plus the two shift directions.
-
-### `Model.get_nn_pairs`
-
-Yielded `(Spin, Spin)` for every bond — horizontal bonds row by row, then vertical bonds.
-Used only by `nn_sum`, itself used only by `energy`. Both are now O(N) vectorised.
-
-**Restore as** a `bonds()` generator yielding *pairs of index arrays* rather than pairs of
-objects:
+The original `Model.get_nn_pairs` yielded `(Spin, Spin)` for every bond — horizontal bonds row by
+row, then vertical bonds. The enumeration is preserved implicitly in the slice shifts of
+`neighbour_sum`. The explicit form, when bond identities are needed rather than bond sums:
 
 ```python
 def bonds(self):
@@ -372,44 +587,36 @@ def bonds(self):
     yield ii[:-1, :], jj[:-1, :], ii[1:, :], jj[1:, :]   # vertical
 ```
 
-This is the form worth having for **bond-resolved observables** — two-point correlation
-functions ⟨s_0 s_r⟩, bond energy histograms, or the edge set for a Wolff/Swendsen–Wang cluster
-build. Add it when one of those is actually needed; it is not needed by the dynamics.
+(Add the wrapping bonds for periodic boundaries.) This is the form worth having for
+**bond-resolved observables** — two-point correlation functions, bond energy histograms, the
+cross-channel wall-coincidence statistic of §12 — and for the **edge set of a Wolff/Swendsen–Wang
+cluster build**. It belongs on `Lattice`, not on any model, since it is pure geometry.
 
-### `Model.define_nn_pairs`
-
-Built the neighbour lists for every site at construction. Wholly replaced by §2 — the
-geometry is now implicit, so there is nothing to precompute and nothing to get wrong at the
-corners.
-
-### `Model.probability_gradient` and `Model.evolution_probs`
-
-See §5. The local field survives as `_local_field()`; the probabilities are computed inline in
-`evolve`. Restore either as a public property in one line if you want to plot the acceptance
-field.
-
-### `Model.z_prob`
-
-See §7 — replaced by `log_weight`, which is the same quantity in a representable form.
-
-### `Model.plot_to_axes` — **retained, not removed**
-
-Dead in the current tree, but it is the right primitive for multi-panel figures (which is
-presumably how `example.png` was made). §9f makes `plot` call it, so it becomes live code.
+Also relevant to §12: the single-site `flip()` primitive removed with the `Spin` class is what a
+Metropolis or cluster update needs, since both flip rather than resample. It was dropped because
+heat-bath *resamples*, not because flipping is wrong; §7 reintroduces the pattern.
 
 ---
 
 ## Work order
 
-0. **Capture golden data first.** Run the *existing* `define_nn_pairs`/`Spin.nn_sum` on a fixed
-   5×5 state and record the neighbour sums. This has to happen before `spin.py` is deleted, or
-   `test_open_bc_topology_unchanged` (§10b) degenerates into testing the new code against itself.
-1. `model.py` rewrite: array state, `_neighbour_sum`, boundary validation (§1–§3).
-2. Checkerboard `evolve`, delete the damping (§4–§5).
-3. Units, `log_weight`, `reduced_temperature`, observables, RNG, annotations, plotting (§6–§9).
-4. Delete `spin.py`, `prelude.py`; clear stale `__pycache__`.
-5. `requirements-dev.txt`, `pytest.ini`, `test_model.py` (§10). Install pytest, run the suite.
-   The reversibility and stationarity tests gate everything above — if they fail, nothing else
-   matters.
-6. `run.py` (§11), then execute it end to end to confirm the figure renders.
-7. `README.md`: document `boundary`, link `method.md`, add the test command.
+Each numbered step is one commit, and each is independently revertible.
+
+0. **Capture golden data first.** Record `Model._neighbour_sum` output on fixed states at several
+   `L` and both boundaries, *before* touching `model.py`, or the `Lattice` test in §9a degenerates
+   into testing the new code against itself.
+1. **`lattice.py`** plus `test_lattice.py`. `Model` delegates to it. **Gate: `test_model.py`
+   passes unmodified.** No behaviour change lands in this commit.
+2. **`sampling.py`** plus its tests. Tiny, standalone, no dependants yet.
+3. **`palette.py`** plus its tests. Also standalone — deliberately before the first model, so the
+   first clock figure is well-coloured on its first render rather than retrofitted.
+4. **`clock.py`** plus `test_clock.py`. **Gate: the `q = 2` identity against `Model`, and the 2×2
+   `q = 3` exact enumeration.** Nothing proceeds past a failure there.
+5. **Static figures 1 and 2** in `run.py`; add `init=` while doing it.
+6. **`spinvector.py` + `xy.py`** plus tests, and the vortex winding-number observable. Figure 3.
+7. **`heisenberg.py`** plus tests. Figure 4.
+8. **`method.md`** update: the geometry/alphabet split, the loss of the transition-matrix tests
+   for continuous spins, and the colour-mapping compromises of §7. **`README.md`**: the new
+   models, the palette argument, the new figures.
+
+Phases 1–5 are the committed scope. 6–7 follow if 1–5 land cleanly. §11 and §12 are not in scope.
