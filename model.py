@@ -1,8 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+from lattice import BOUNDARIES, Lattice
 
-BOUNDARIES = ("open", "periodic")
 
 #: ln(1 + sqrt(2)); the Onsager critical point is at k_B T_c / J = 2 / this.
 _LN1P_SQRT2 = float(np.log(1.0 + np.sqrt(2.0)))
@@ -31,51 +31,37 @@ class Model:
                  boundary: str="open",
                  seed: int | None=None
              ):
-        if lattice_length < 1:
-            raise ValueError(
-                f"lattice_length must be at least 1, got {lattice_length}."
-            )
-        if boundary not in BOUNDARIES:
-            raise ValueError(
-                f"boundary must be one of {BOUNDARIES}, got {boundary!r}."
-            )
-        if boundary == "periodic":
-            if lattice_length < 3:
-                raise ValueError(
-                    "Periodic boundaries need lattice_length >= 3; below that a "
-                    "site is its own neighbour twice over and every bond is "
-                    f"double counted (got {lattice_length})."
-                )
-            if lattice_length % 2 != 0:
-                raise ValueError(
-                    "Periodic boundaries need an even lattice_length: the wrap "
-                    "closes odd-length cycles, the lattice stops being "
-                    "bipartite, and the checkerboard update in `evolve` is no "
-                    f"longer exact (got {lattice_length})."
-                )
+        # Geometry validation lives on the Lattice, which owns the boundary.
+        self.lattice = Lattice(lattice_length, boundary)
         if temperature <= 0:
             raise ValueError(f"temperature must be positive, got {temperature}.")
 
-        self.lattice_length = lattice_length
-        self.boundary = boundary
         self.rng = np.random.default_rng(seed)
         self.spins = self.rng.choice(
             np.array([-1, 1], dtype=np.int8), size=(lattice_length, lattice_length)
         )
 
-        # Scratch buffer for neighbour sums, allocated once. The halo stays
-        # zero for open boundaries and is refilled from the edges for periodic
-        # ones, so both cases share a single code path.
-        self._pad = np.zeros((lattice_length + 2, lattice_length + 2), dtype=np.int8)
-
-        # Checkerboard colouring: every black site's neighbours are all white.
-        rows, cols = np.indices((lattice_length, lattice_length))
-        self._black = (rows + cols) % 2 == 0
-        self._white = ~self._black
-
         self.T = temperature
         self.H = field
         self.J = coupling
+
+    # Geometry is delegated, but forwarded here so the public surface of the
+    # model is unchanged by the extraction.
+    @property
+    def lattice_length(self) -> int:
+        return self.lattice.lattice_length
+
+    @property
+    def boundary(self) -> str:
+        return self.lattice.boundary
+
+    @property
+    def _black(self) -> np.ndarray:
+        return self.lattice.black
+
+    @property
+    def _white(self) -> np.ndarray:
+        return self.lattice.white
 
     @property
     def beta(self) -> float:
@@ -190,17 +176,7 @@ class Model:
         of a zero halo and periodic ones out of a wrapped halo. Values stay in
         [-4, 4], well inside `int8`.
         """
-        spins = self.spins
-        pad = self._pad
-        pad[1:-1, 1:-1] = spins
-        if self.boundary == "periodic":
-            pad[0, 1:-1] = spins[-1, :]
-            pad[-1, 1:-1] = spins[0, :]
-            pad[1:-1, 0] = spins[:, -1]
-            pad[1:-1, -1] = spins[:, 0]
-        # The halo corners are never read.
-        return (pad[:-2, 1:-1] + pad[2:, 1:-1]
-                + pad[1:-1, :-2] + pad[1:-1, 2:])
+        return self.lattice.neighbour_sum(self.spins)
 
     def _local_field(self) -> np.ndarray:
         """
@@ -242,7 +218,7 @@ class Model:
         at any lattice size worth simulating.
         """
         beta = self.beta
-        for sublattice in (self._black, self._white):
+        for sublattice in self.lattice.sublattices:
             p = 0.5 * (1.0 + np.tanh(beta * self._local_field()))
             new = np.where(self.rng.random(p.shape) < p, np.int8(1), np.int8(-1))
             np.copyto(self.spins, new, where=sublattice)
