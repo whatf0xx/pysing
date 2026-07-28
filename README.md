@@ -81,7 +81,18 @@ python demo.py    # the Potts and clock models, one panel per phase
 
 `demo.py` pops up two windows: the 3-state Potts model either side of its exact critical point,
 and the 8-state clock model across all three of its phases. `python demo.py --help` for lattice
-size, sweep count, `q`, and `--save DIR` to write PNGs instead.
+size, sweep count, `q`, `--smoothed` to add a coarse-grained row under the clock microstates, and
+`--save DIR` to write PNGs instead.
+
+An ordered phase is degenerate — the `q` states are related by a symmetry, so which one a lattice
+settles into is decided once and never revisited, and no amount of extra sweeps will move it. The
+panels are therefore started in *different* states, chosen without replacement; starting them all
+in state 0 would paint every ordered panel the same colour and make state 0 look special, which is
+the exact artifact the equal-lightness palette exists to prevent. `--init anneal` instead cools in
+from disorder and lets the dynamics do the choosing, which is honest but slow: it needs a few
+thousand sweeps and stops working above about `L = 96`, because breaking the symmetry from a hot
+start means coarsening domains, and that takes of order `L²` sweeps. See the `demo.py` docstring
+for the measured numbers.
 
 Popping up a window needs a GUI toolkit, which `matplotlib` does not bring with it — without one
 it falls back to the `agg` backend, which renders fine but has nothing to render *into*, and

@@ -1,29 +1,54 @@
 """
 Interactive demonstrations of the colour models.
 
-    python demo.py            # both figures
-    python demo.py potts      # 3-state Potts, either side of its exact T_c
-    python demo.py clock      # 8-state clock, all three phases
-    python demo.py --init hot # quench from disorder instead: see the difference
-    python demo.py --save figures/     # write PNGs instead of popping windows
+    python demo.py             # both figures
+    python demo.py potts       # 3-state Potts, either side of its exact T_c
+    python demo.py clock       # 8-state clock, all three phases
+    python demo.py --smoothed  # add the coarse-grained clock row
+    python demo.py --init anneal --size 96   # cool in, and let the model choose
+    python demo.py --save figures/           # write PNGs, don't pop windows
 
 Each figure is one model at three temperatures, one panel per phase.
 
-A note on the protocol, because it changes what the pictures mean. Panels
-start from a *uniform* lattice and run at the target temperature. That is the
-cheap way into the low-temperature phases: a quench from disorder has to
-coarsen its domains, which takes of order L**2 sweeps, so on any lattice
-worth looking at it freezes into a picture of its own history instead of the
-phase. Above the transition the memory of the start is gone within a few
-sweeps and the choice does not matter. Both were checked here rather than
-assumed -- at every temperature in these figures except the Potts critical
-point, hot and cold starts land on the same order parameter, and it stops
-moving between 500 and 1500 sweeps.
+A note on the protocol, because it decides what the pictures mean.
 
-The exception is real and is left in: at `T_c` the two starts *bracket* the
-answer instead of meeting, however long they are run. That is critical
-slowing down, and it is what cluster algorithms exist to fix. Run with
-`--init hot` to watch it happen from the other side.
+An ordered phase is *degenerate*. The q states are related by a symmetry, so
+each is as good a ground state as the next, and which one a given lattice
+settles into is not something more sweeps will change -- that is exactly what
+spontaneous symmetry breaking is. Somebody has to choose. Panels here start
+from a uniform lattice and run at the target temperature, which chooses by
+hand and is the cheap way in: a quench from disorder has to coarsen its
+domains, which takes of order L**2 sweeps, so on a lattice worth looking at
+it freezes into a picture of its own history instead of the phase.
+
+The state each panel is started in is drawn without replacement rather than
+being state 0 every time. That is the whole reason the panels come out in
+different colours. Starting them all in state 0 -- the earlier behaviour --
+made every ordered panel pink, which reads as "state 0 is special" and is
+precisely the artifact the equal-lightness palette exists to prevent. Above
+the transition none of it matters; memory of the start is gone within a few
+sweeps, which was checked rather than assumed.
+
+`--init anneal` does it the honest way instead: start disordered, cool
+geometrically through the transition over the first half of the sweeps, and
+let the dynamics break the symmetry. Whether that finishes is a question
+about coarsening, and the answer was measured rather than guessed -- Potts
+q = 3 into `0.85 T_c`, order parameter after annealing:
+
+    L    500 sweeps   2000 sweeps   8000 sweeps
+    48      0.12         0.95          0.94
+    96      0.45         0.95          0.95
+    192     0.17         0.12          0.23
+
+So it works up to about L = 96 given a few thousand sweeps, and at the
+default L = 192 it does not work at all -- 8000 sweeps take 70 s a panel and
+still leave three domains. Use it at `--size 96 --sweeps 2000` to watch a
+model pick its own ground state; at the default size it shows coarsening,
+which is worth seeing once but is not a picture of a phase.
+
+One further exception is real and is left in: at `T_c` hot and cold starts
+*bracket* the answer instead of meeting, however long they are run. That is
+critical slowing down, and it is what cluster algorithms exist to fix.
 """
 import argparse
 import os
@@ -53,9 +78,79 @@ MUTED = "#9aa0a6"
 PALETTE = {"uniform_chroma": False}
 
 
-def run(model, sweeps, label):
-    for _ in tqdm(range(sweeps), desc=label, leave=False):
+def starting_states(q, panels, seed):
+    """
+    One state per panel to start a cold run in: `panels` of the q states,
+    spread as evenly round them as q allows, from a random offset.
+
+    An ordered phase is degenerate, so which of the q states a panel sits in
+    is an input, not a result. Starting every panel in state 0 -- what a bare
+    `init="cold"` does -- therefore paints every ordered panel in state 0's
+    colour, which is exactly the "one state looks special" artifact the
+    equal-lightness palette exists to avoid. Choosing a different state per
+    panel costs nothing and shows the degeneracy instead of hiding it.
+
+    Spread rather than a random permutation, because for the clock model the
+    labels *are* the hue wheel: neighbouring labels are neighbouring colours,
+    and a permutation will cheerfully hand two panels states 0 and 1, which
+    read as the same colour. Stepping by q/panels puts them as far apart on
+    the wheel as there is room for. The offset is the only random part, and
+    it is what stops state 0 being the one that always turns up.
+    """
+    offset = np.random.default_rng(seed).integers(q)
+    return (offset + np.arange(panels) * q // panels) % q
+
+
+def protocol_note(init):
+    """
+    One caption sentence saying where an ordered panel's colour came from,
+    since the three protocols answer that completely differently and the
+    figure would otherwise claim whichever one was written down.
+    """
+    if init == "cold":
+        return ("Which state an ordered panel lands in is degenerate and is "
+                "set by its start, so the three are started in different "
+                "states on purpose.")
+    if init == "anneal":
+        return ("Each panel was cooled in from disorder, so the state it "
+                "locked into was chosen by the dynamics rather than handed "
+                "to it -- if it finished coarsening.")
+    return ("Each panel was quenched from disorder, so an ordered one shows "
+            "domains still coarsening rather than a settled phase.")
+
+
+def run(model, sweeps, label, init, state=0, hot=None):
+    """
+    Equilibrate `model` at its own temperature and leave it there.
+
+    Three protocols, because the choice changes what the picture means:
+
+    - `cold` fills the lattice with `state` and runs at the target. Fast, and
+      an equilibrium sample *within* one symmetry sector, but the sector was
+      chosen by hand.
+    - `hot` quenches: a random lattice dropped straight to the target.
+    - `anneal` starts random and cools geometrically from `hot` into the
+      target over the first half of the sweeps, so the dynamics break the
+      symmetry rather than being handed the answer. This is the honest
+      protocol and the slow one -- see the module docstring for the sweeps
+      it needs at a given lattice size.
+
+    The cold fill is done here rather than through the model's own
+    `init="cold"` because that always means state 0, and choosing the state
+    is the entire point.
+    """
+    target = model.T
+    schedule = np.full(sweeps, target)
+    if init == "cold":
+        model.labels.fill(state)
+    elif init == "anneal" and sweeps:
+        cooling = max(1, sweeps // 2)
+        schedule[:cooling] = np.geomspace(max(hot, target), target, cooling)
+
+    for temperature in tqdm(schedule, desc=label, leave=False):
+        model.T = float(temperature)
         model.evolve()
+    model.T = target
     return model
 
 
@@ -88,9 +183,9 @@ def phase_field_rgb(model, width):
     return oklch_to_srgb(DEFAULT_LIGHTNESS, chroma, angle)
 
 
-def swatch(fig, palette, label):
+def swatch(fig, palette, label, rectangle):
     """The model's palette as a strip, so the state space itself is visible."""
-    ax = fig.add_axes([0.36, 0.125, 0.28, 0.021])
+    ax = fig.add_axes(rectangle)
     ax.imshow(palette[None, :, :], aspect="auto", interpolation="nearest")
     ax.set_xticks([])
     ax.set_yticks([])
@@ -118,15 +213,59 @@ def wrap(caption, columns=145):
     return textwrap.fill(protected, columns).replace("\0", " ")
 
 
-def figure(panels, suptitle, caption, palette, palette_label):
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 5.8), facecolor=BACKGROUND)
-    for ax, (model, title, subtitle) in zip(axes, panels):
-        panel(ax, model, title, subtitle)
-    fig.suptitle(suptitle, color=FOREGROUND, fontsize=14, y=0.965)
-    fig.text(0.5, 0.052, wrap(caption), color=MUTED, fontsize=8.5,
-             ha="center", va="center")
-    fig.subplots_adjust(top=0.85, bottom=0.21, left=0.03, right=0.97, wspace=0.06)
-    swatch(fig, palette, palette_label)
+#: Geometry by row count. A two-row figure is two thirds taller, so the same
+#: fractional margins would not read as the same white space.
+LAYOUT = {
+    1: dict(figsize=(13.5, 5.8), suptitle_y=0.965, columns=145,
+            adjust=dict(top=0.85, left=0.03, right=0.97, wspace=0.06)),
+    2: dict(figsize=(13.5, 9.6), suptitle_y=0.975, columns=170,
+            adjust=dict(top=0.90, left=0.035, right=0.985, wspace=0.06,
+                        hspace=0.16)),
+}
+
+#: The strip below the panels, in points, stacked from the bottom edge up:
+#: caption, then the swatch's label, then the swatch itself, then the panels'
+#: own labels. Measured rather than pinned to fractions of the figure height,
+#: because the caption changes length with `--q`, the protocol and the sweep
+#: count -- at a fixed anchor a fifth line either clips off the canvas or
+#: shoves the swatch through the panel labels, and both happened.
+CAPTION_SIZE = 8.5
+CAPTION_LEADING = 1.25
+CAPTION_MARGIN = 7.0
+SWATCH_LABEL_SPACE = 12.0
+SWATCH_HEIGHT = 9.0
+PANEL_LABEL_SPACE = 21.0
+
+
+def figure(panels, suptitle, caption, palette, palette_label, second_row=None):
+    """
+    A row of microstates, titled and captioned, with the palette below it.
+
+    `second_row` is an optional `(axes, model) -> None` drawing a derived
+    view of the same three models underneath.
+    """
+    rows = 1 if second_row is None else 2
+    layout = LAYOUT[rows]
+    points = 72.0 * layout["figsize"][1]
+
+    text = wrap(caption, layout["columns"])
+    lines = text.count("\n") + 1
+    swatch_bottom = (CAPTION_MARGIN + lines * CAPTION_SIZE * CAPTION_LEADING
+                     + SWATCH_LABEL_SPACE)
+    panels_bottom = swatch_bottom + SWATCH_HEIGHT + PANEL_LABEL_SPACE
+
+    fig, axes = plt.subplots(rows, 3, figsize=layout["figsize"],
+                             facecolor=BACKGROUND, squeeze=False)
+    for column, (model, title, subtitle) in enumerate(panels):
+        panel(axes[0, column], model, title, subtitle)
+        if second_row is not None:
+            second_row(axes[1, column], model)
+    fig.suptitle(suptitle, color=FOREGROUND, fontsize=14, y=layout["suptitle_y"])
+    fig.subplots_adjust(bottom=panels_bottom / points, **layout["adjust"])
+    fig.text(0.5, CAPTION_MARGIN / points, text, color=MUTED,
+             fontsize=CAPTION_SIZE, ha="center", va="bottom")
+    swatch(fig, palette, palette_label,
+           [0.36, swatch_bottom / points, 0.28, SWATCH_HEIGHT / points])
     return fig
 
 
@@ -149,11 +288,13 @@ def potts_figure(length, sweeps, seed, init, q=3):
     ]
 
     panels = []
-    for ratio, name in settings:
+    for (ratio, name), state in zip(settings,
+                                    starting_states(q, len(settings), seed)):
         model = PottsModel(length, q=q, temperature=ratio * critical,
-                           coupling=1.0, boundary="periodic", init=init,
+                           coupling=1.0, boundary="periodic", init="hot",
                            seed=seed)
-        run(model, sweeps, f"potts {name}")
+        run(model, sweeps, f"potts {name}", init, state=state,
+            hot=2.0 * critical)
         panels.append((
             model,
             f"{name}     $T = {ratio:.2f}\\,T_c$",
@@ -165,21 +306,19 @@ def potts_figure(length, sweeps, seed, init, q=3):
         panels,
         f"{q}-state Potts model, $L = {length}$,   "
         f"$T_c = J/\\ln(1+\\sqrt{{{q}}}) = {critical:.3f}\\,J$",
-        f"{sweeps} sweeps from a {init} start. One state takes the lattice "
-        "below $T_c$; above it, colour is uncorrelated beyond a couple of "
-        "lattice spacings. The middle panel is the honest exception: at "
-        "$T_c$ hot and cold starts bracket the order parameter rather than "
-        "meeting, so it is a snapshot of the critical region and not an "
-        f"equilibrium sample. The {q} colours are interchangeable -- Potts "
-        "states have no ordering, so the palette only has to avoid "
-        "privileging one, which an equal-lightness ring does and a stock "
-        "colormap does not.",
+        f"{sweeps} sweeps, {init}. One state takes the lattice below $T_c$; "
+        "above it, colour is uncorrelated beyond a couple of lattice "
+        f"spacings. The {q} colours are interchangeable -- Potts states have "
+        f"no ordering. {protocol_note(init)} The middle panel is the honest "
+        "exception: at $T_c$ hot and cold starts bracket the order parameter "
+        "rather than meeting, so it is a snapshot of the critical region and "
+        "not an equilibrium sample.",
         PottsModel(4, q=q).palette(**PALETTE),
         f"the {q} states (assignment is arbitrary)",
     )
 
 
-def clock_figure(length, sweeps, seed, init, q=8):
+def clock_figure(length, sweeps, seed, init, q=8, smoothed=False):
     """
     The q-state clock model, which for `q >= 5` has *three* phases.
 
@@ -192,6 +331,11 @@ def clock_figure(length, sweeps, seed, init, q=8):
     why they are given as plain temperatures rather than as ratios:
     `ClockModel.critical_temperature` deliberately raises for `q >= 5` rather
     than return a number it cannot justify.
+
+    `smoothed` adds a second row of coarse-grained fields under the
+    microstates. It is off by default: it trades away every bit of site-level
+    detail for one long-wavelength feature, which is a bad trade unless that
+    feature is what you came for.
     """
     settings = [
         (0.35, "locked"),
@@ -204,72 +348,62 @@ def clock_figure(length, sweeps, seed, init, q=8):
     # the long-wavelength structure. Odd, so the window is centred.
     width = max(3, (length // 16) | 1)
 
-    models = []
-    for temperature, name in settings:
+    panels = []
+    for (temperature, name), state in zip(
+            settings, starting_states(q, len(settings), seed)):
         model = ClockModel(length, q=q, temperature=temperature, coupling=1.0,
-                           boundary="periodic", init=init, seed=seed)
-        run(model, sweeps, f"clock {name}")
-        models.append(model)
-
-    fig, axes = plt.subplots(2, 3, figsize=(13.5, 9.6), facecolor=BACKGROUND)
-    for column, (model, (temperature, name)) in enumerate(zip(models, settings)):
-        top, bottom = axes[0, column], axes[1, column]
-        panel(
-            top, model,
+                           boundary="periodic", init="hot", seed=seed)
+        run(model, sweeps, f"clock {name}", init, state=state,
+            hot=2.0 * XY_BKT_TEMPERATURE)
+        panels.append((
+            model,
             f"{name}     $T = {temperature:.2f}\\,J$",
             f"$|m| = {model.order_parameter:.2f}$,   "
             f"largest population $= {model.populations.max():.2f}$",
-        )
-        bottom.set_facecolor(BACKGROUND)
-        bottom.imshow(phase_field_rgb(model, width), interpolation="nearest")
-        bottom.set_xticks([])
-        bottom.set_yticks([])
-        bottom.set_xlabel(
-            f"mean coherence $= {model.phase_field(width)[1].mean():.2f}$",
-            color=MUTED, fontsize=9, labelpad=6,
-        )
-        for spine in bottom.spines.values():
+        ))
+
+    def phase_field_row(ax, model):
+        ax.set_facecolor(BACKGROUND)
+        ax.imshow(phase_field_rgb(model, width), interpolation="nearest")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel(f"mean coherence $= {model.phase_field(width)[1].mean():.2f}$",
+                      color=MUTED, fontsize=9, labelpad=6)
+        for spine in ax.spines.values():
             spine.set_edgecolor("#3a3d42")
 
-    fig.suptitle(
+    caption = (
+        f"{sweeps} sweeps, {init}. The two ordered phases are not told apart "
+        "by $|m|$, which is large in both -- the populations are. Locked, the "
+        "lattice sits in a single state and hue is flat; quasi-long-range, "
+        "hue winds smoothly through neighbouring states, so several are "
+        f"occupied at once; disordered, all {q} are equally likely. "
+        f"{protocol_note(init)} The upper transition approaches the XY value "
+        f"$T \\approx {XY_BKT_TEMPERATURE}\\,J$ from below as $q$ grows."
+    )
+    if smoothed:
+        caption += (
+            " The winding is long-wavelength and the top row buries it in "
+            "site-level speckle, so the bottom row averages the spin vectors "
+            "over a sliding window: hue is the local mean direction, chroma "
+            "is the local coherence, and it collapses to grey where there is "
+            "nothing coherent to report."
+        )
+
+    fig = figure(
+        panels,
         f"{q}-state clock model, $L = {length}$:   three phases, "
         "two Kosterlitz-Thouless transitions",
-        color=FOREGROUND, fontsize=14, y=0.975,
+        caption,
+        ClockModel(4, q=q).palette(**PALETTE),
+        f"the {q} states, at their own angles on the hue wheel",
+        second_row=phase_field_row if smoothed else None,
     )
-    fig.text(0.012, 0.70, "microstate", color=FOREGROUND, fontsize=10,
-             rotation=90, ha="center", va="center")
-    fig.text(0.012, 0.34, f"smoothed  ({width}x{width})",
-             color=FOREGROUND, fontsize=10, rotation=90, ha="center", va="center")
-    fig.text(
-        0.5, 0.048,
-        wrap(
-            f"{sweeps} sweeps from a {init} start. The two ordered phases are "
-            "not told apart by $|m|$, which is large in both -- the "
-            "populations are. Locked, the lattice sits in a single state and "
-            "hue is flat; quasi-long-range, hue winds smoothly through "
-            f"neighbouring states, so several are occupied at once; "
-            f"disordered, all {q} are equally likely. That winding is a "
-            "long-wavelength feature and the top row buries it in site-level "
-            "speckle, so the bottom row averages the spin vectors over a "
-            "sliding window: hue is the local mean direction, chroma is the "
-            "local coherence, and it collapses to grey where there is nothing "
-            "coherent to report. The upper transition approaches the XY value "
-            f"$T \\approx {XY_BKT_TEMPERATURE}\\,J$ from below as $q$ grows.",
-            columns=170,
-        ),
-        color=MUTED, fontsize=8.5, ha="center", va="center",
-    )
-    fig.subplots_adjust(top=0.90, bottom=0.175, left=0.035, right=0.985,
-                        wspace=0.06, hspace=0.16)
-    swatch_ax = fig.add_axes([0.36, 0.122, 0.28, 0.013])
-    swatch_ax.imshow(ClockModel(4, q=q).palette(**PALETTE)[None, :, :],
-                     aspect="auto", interpolation="nearest")
-    swatch_ax.set_xticks([])
-    swatch_ax.set_yticks([])
-    swatch_ax.set_xlabel(f"the {q} states, at their own angles on the hue wheel",
-                         color=MUTED, fontsize=8, labelpad=4)
-    for spine in swatch_ax.spines.values():
-        spine.set_edgecolor("#3a3d42")
+    if smoothed:
+        fig.text(0.012, 0.70, "microstate", color=FOREGROUND, fontsize=10,
+                 rotation=90, ha="center", va="center")
+        fig.text(0.012, 0.34, f"smoothed  ({width}x{width})", color=FOREGROUND,
+                 fontsize=10, rotation=90, ha="center", va="center")
     return fig
 
 
@@ -305,9 +439,13 @@ def main():
                         help="lattice length (default: 192)")
     parser.add_argument("--sweeps", type=int, default=500,
                         help="sweeps per panel (default: 500)")
-    parser.add_argument("--init", default="cold", choices=["cold", "hot"],
-                        help="starting configuration (default: cold; see the "
+    parser.add_argument("--init", default="cold",
+                        choices=["cold", "hot", "anneal"],
+                        help="equilibration protocol (default: cold; see the "
                              "module docstring for why)")
+    parser.add_argument("--smoothed", action="store_true",
+                        help="add a coarse-grained row under the clock "
+                             "microstates")
     parser.add_argument("--q", type=int, default=8,
                         help="number of clock states (default: 8)")
     parser.add_argument("--potts-q", type=int, default=3,
@@ -326,7 +464,8 @@ def main():
                                         args.init, q=args.potts_q)
     if args.which in ("all", "clock"):
         figures["clock"] = clock_figure(args.size, args.sweeps, args.seed,
-                                        args.init, q=args.q)
+                                        args.init, q=args.q,
+                                        smoothed=args.smoothed)
 
     if args.save:
         os.makedirs(args.save, exist_ok=True)
