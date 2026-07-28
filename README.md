@@ -83,6 +83,13 @@ python demo.py    # the Potts and clock models, one panel per phase
 and the 8-state clock model across all three of its phases. `python demo.py --help` for lattice
 size, sweep count, `q`, and `--save DIR` to write PNGs instead.
 
+Popping up a window needs a GUI toolkit, which `matplotlib` does not bring with it — without one
+it falls back to the `agg` backend, which renders fine but has nothing to render *into*, and
+`plt.show()` warns and returns. `pip install PyQt6` if you hit that; the package is `PyQt6`, not
+`pyqt`, and `pyside6` or the system `python3-tk` do just as well. It is deliberately not in
+`requirements.txt`: it is an 86 MB download that only the demo needs, and `--save DIR` does not
+need it at all.
+
 ### Tests
 
 ```

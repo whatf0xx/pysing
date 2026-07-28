@@ -31,6 +31,7 @@ import re
 import textwrap
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -272,6 +273,28 @@ def clock_figure(length, sweeps, seed, init, q=8):
     return fig
 
 
+def check_backend():
+    """Fail before the simulation, not after it.
+
+    With no GUI toolkit installed matplotlib falls back to `agg`, which draws
+    perfectly well but has no window to draw into: `plt.show()` warns and
+    returns. Since the figures take about a minute to generate, finding that
+    out at the end is the worst possible time, so check up front.
+    """
+    from matplotlib.backends import BackendFilter, backend_registry
+    if matplotlib.get_backend() in backend_registry.list_builtin(
+            BackendFilter.INTERACTIVE):
+        return
+    raise SystemExit(
+        f"matplotlib is using the non-interactive '{matplotlib.get_backend()}' "
+        "backend, so there is no window to pop up.\n"
+        "Install a GUI toolkit:  pip install PyQt6\n"
+        "(the pip package is 'PyQt6', not 'pyqt'; 'pyside6' also works, as "
+        "does the system python3-tk)\n"
+        "Or use --save DIR to write PNGs instead."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Interactive demos of the Potts and clock models."
@@ -293,6 +316,9 @@ def main():
     parser.add_argument("--save", metavar="DIR",
                         help="write PNGs here instead of showing windows")
     args = parser.parse_args()
+
+    if not args.save:
+        check_backend()
 
     figures = {}
     if args.which in ("all", "potts"):
