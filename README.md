@@ -1,6 +1,6 @@
 # pysing
 
-*A pure Python generator for Ising model microstates.*
+*A pure Python generator for lattice model microstates.*
 
 ## About
 
@@ -36,6 +36,33 @@ requires an **even** lattice length of at least 4: the wraparound closes odd-len
 cycles when the length is odd, the lattice stops being bipartite, and the sublattice
 update is no longer exact.
 
+## Models with more than two states
+
+`Model` is the Ising model: two states per site, rendered as a false-colour map of ±1. Two more
+models put a *colour space* on the sites instead, so the picture is a direct rendering of the
+microstate rather than a recolouring of it.
+
+**`PottsModel`** — `q` states with no geometry between them, coupled only by whether neighbours
+agree: `E = −J Σ δ(s_i, s_j)`. Every pair of states is equally distinct, so the colours are
+arbitrary and every domain wall is equally hard. In exchange the critical point is exact for every
+`q` by self-duality, at `T_c = J / ln(1 + √q)`, and the transition changes order at `q = 5`.
+
+**`ClockModel`** — `q` states equally spaced on a circle, `E = −J Σ cos(θ_i − θ_j)` with
+`θ_k = 2πk/q`. The state space *is* the hue wheel, so states close in energy are close in colour:
+walls between adjacent hues come out soft and walls between opposite hues hard, with no tuning.
+For `q ≥ 5` it has **three** phases separated by two Kosterlitz–Thouless transitions — a
+low-temperature phase locked to the `q` discrete directions, an intermediate phase where the hue
+winds smoothly and the overall direction is free to rotate, and a disordered phase.
+
+Both are sampled with the same exact checkerboard heat bath as `Model`, and share its lattice
+geometry through `Lattice`. `ClockModel(q=2)` is `Model` at the same coupling — not approximately,
+identically — which is the strongest regression test in the suite. See [`method.md`](method.md).
+
+Colours come from `palette.py`, which builds hue rings at constant Oklab lightness so that no
+state is visually privileged. Stock colormaps are not built that way: at full saturation `hsv`
+swings by more than a factor of ten in luminance around the wheel, which invents contrast the
+physics does not have.
+
 ## Example
 
 ![Ising model microstates](https://github.com/whatf0xx/pysing/blob/main/example.png?raw=true)
@@ -48,13 +75,18 @@ cd pysing
 python -m venv .env
 source .env/bin/activate
 pip install -r requirements.txt
-python -m run
+python -m run     # the Ising relaxation demo
+python demo.py    # the Potts and clock models, one panel per phase
 ```
+
+`demo.py` pops up two windows: the 3-state Potts model either side of its exact critical point,
+and the 8-state clock model across all three of its phases. `python demo.py --help` for lattice
+size, sweep count, `q`, and `--save DIR` to write PNGs instead.
 
 ### Tests
 
 ```
 pip install -r requirements-dev.txt
-pytest -m "not slow"   # ~1 s
-pytest                 # ~20 s, adds the statistical checks
+pytest -m "not slow"   # ~5 s
+pytest                 # ~40 s, adds the statistical checks
 ```

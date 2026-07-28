@@ -116,6 +116,85 @@ measured in "steps" therefore rescales by about $1/0.8$ **on top of** the change
 the dynamics. The two effects are not separable; a τ extracted under the old scheme should not
 be compared to one extracted under the new.
 
+## Difference 6: the alphabet is now pluggable, and the geometry is shared
+
+Everything above concerns one model. Adding the Potts and clock models forced the question of what
+they actually share with it, and the answer is cleaner than expected: a lattice model splits into
+a **geometry** half and an **alphabet** half, and the two have nothing to say to each other.
+
+The geometry half — which sites are neighbours, how the boundary closes, which sites may be
+updated simultaneously — is *identical* for Ising, Potts, clock, XY and Heisenberg. It is now
+`Lattice`, and it knows nothing about spins. The one trick that makes it shared rather than merely
+similar is that `neighbour_sum` takes any `(..., L, L)` array and sums over the trailing two axes,
+so a scalar Ising spin, a `(2, L, L)` clock vector and a `(q, L, L)` one-hot occupancy all go
+through the same four shifted slices. `Model` holds one and delegates; its public surface did not
+change, and the acceptance criterion for the extraction was that `test_model.py` passed unmodified.
+
+The alphabet half — what lives on a site, and the conditional it is redrawn from — shares *no*
+code, and deliberately so. The three conditionals are a `tanh`, a q-way softmax over a dot product
+with a two-vector field, and a q-way softmax over neighbour counts. Unifying them would mean
+inventing an abstraction over three expressions that are already one line each. The only genuinely
+shared piece is `sample_categorical`, which draws a label per site from `(q, L, L)` log-weights,
+and which reproduces the Ising `tanh` conditional to 4.4e-16 when handed two states.
+
+### Why the clock model, and why its tests are unusually strong
+
+The clock model confines spins to `q` equally spaced directions on a circle. Because
+`cos(θ_i − θ_j) = n̂_i · n̂_j`, the local field is a two-vector `h = H + J Σ_nn n̂_j` and the
+conditional is `p(k) ∝ exp(β h · n̂_k)` — the same "dot the local field with the candidate" shape
+as the Ising heat bath, with two components and `q` candidates instead of one and two.
+
+Its state space *is* the hue wheel, so the colour map is forced rather than chosen. It also
+collapses onto solved models at three values of `q`, which is what the test suite is built around:
+
+| q | reduces to | relation |
+|---|---|---|
+| 2 | **Ising at the same J** | `θ ∈ {0, π}` ⇒ `cos(θ_i − θ_j) = s_i s_j`. An identity, checked to machine precision against `Model.heat_bath_probs` |
+| 3 | 3-state Potts | `cos` takes only `{1, −½}`, an affine map of `δ`: `E_clock = 1.5 E_Potts + n_bonds/2` |
+| 4 | **two Ising models at J/2** | rotate 45°, `n̂ = (s, t)/√2` ⇒ `n̂_i · n̂_j = (s_i s_j + t_i t_j)/2` |
+
+The additive constant at `q = 3` is not cosmetic. It cancels out of the normalised conditional —
+so a `q = 3` clock model and a `q = 3` Potts model at `1.5 J` have *identical dynamics*, which is
+itself a test — but it does not cancel out of the energy, and omitting it gives an energy wrong by
+a lattice-dependent amount that still orders states correctly.
+
+Potts contributes the other exact anchor: self-duality puts its critical point at
+`T_c = J / ln(1 + √q)` for every `q`, and at `q = 2` it must agree with Onsager once the coupling
+is doubled, since `δ(s, s') = (1 + s s')/2`.
+
+### What the pictures need that the physics does not
+
+Two additions exist purely so that a figure shows what is actually there.
+
+**Equal-lightness palettes.** `hsv`, `tab10` and friends vary wildly in perceived lightness around
+the wheel — their yellow reads as foreground and their blue as background — so a viewer sees
+contrast that is an artifact of the palette. `palette.py` builds hue rings at fixed Oklab
+lightness instead, where equal `L` really does read as equal lightness. Chroma is a separate
+question: insisting on one chroma for the whole ring costs a lot of saturation, because the sRGB
+gamut is lopsided and the whole ring gets throttled to whatever blue can manage, so
+`oklch_ring(uniform_chroma=False)` gives each hue its own maximum. Lightness uniformity is the
+claim that matters; chroma uniformity is a nicety.
+
+**A phase field.** The intermediate phase of a `q ≥ 5` clock model is a long-wavelength
+phenomenon: the direction winds slowly across the lattice while individual sites still fluctuate
+hard between neighbouring states. At `T = 0.65 J`, `q = 8`, fewer than half the sites are in the
+most popular state, so a raw microstate buries the winding in speckle. `ClockModel.phase_field`
+averages the spin *vectors* over a sliding window and returns the local mean direction together
+with its length. Reporting that length is what keeps this honest: where the spins are genuinely
+uncorrelated the mean is short, and a renderer should desaturate rather than draw a confident
+colour.
+
+### What the test suite loses, and what replaces it
+
+The strongest tests on the Ising side are structural: the exact half-sweep transition matrix on a
+3×3 lattice is checked to be reversible with respect to the Boltzmann distribution, with no
+sampling and no tolerance. That generalises to the clock and Potts models — `test_clock.py` builds
+the same matrix over all 81 label configurations of a 2×2 lattice at `q = 3` — but it will **not**
+generalise to XY or Heisenberg, whose state spaces are continuous and have no transition matrix to
+enumerate. Those models will need closed-form single-site limits (the Langevin function for
+Heisenberg, a ratio of Bessel functions for XY) to carry the same weight, which is worth knowing
+before they are written rather than after.
+
 ## What is deliberately *not* changed
 
 - **No Metropolis.** Heat-bath is already what the code does, and it is a fine algorithm; there

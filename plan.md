@@ -21,21 +21,40 @@ exact checkpoints (§5.5).
 
 | Item | Status | Why |
 |---|---|---|
-| §1 `Lattice` extraction | **GO** | the shared half; everything else depends on it |
-| §2 `sample_categorical` | **GO** | shared by clock, Potts, and any discrete model |
-| §3 Oklch palettes | **GO** | this is what makes the figures pop rather than look like clip art |
-| §4 Clock model, heat bath | **GO** | primary deliverable |
-| §5 Potts | **SKETCH** | written up, not built; clock subsumes most of the interest |
-| §6 XY | **GO (phase 3)** | clock at q→∞; numpy samples the conditional natively |
-| §7 Heisenberg, Metropolis | **GO (phase 4)** | n=3; simplest sampler first, exact one deferred |
-| §8 Observables | **GO** | per model, as each lands |
-| §9 Tests | **GO** | gates every phase |
-| §10 Static figures | **GO** | the deliverable for now |
+| §1 `Lattice` extraction | **DONE** | the shared half; everything else depends on it |
+| §2 `sample_categorical` | **DONE** | shared by clock, Potts, and any discrete model |
+| §3 Oklch palettes | **DONE** | this is what makes the figures pop rather than look like clip art |
+| §4 Clock model, heat bath | **DONE** | primary deliverable |
+| §5 Potts | **DONE** | promoted from SKETCH: wanted for its own sake, and it is a small delta |
+| §6 XY | **GO (next)** | clock at q→∞; numpy samples the conditional natively |
+| §7 Heisenberg, Metropolis | **GO (after XY)** | n=3; simplest sampler first, exact one deferred |
+| §8 Observables | **DONE** for the discrete models | per model, as each lands |
+| §9 Tests | **DONE** for the discrete models | gates every phase |
+| §10 Static figures | **DONE**, as `demo.py` | the deliverable for now |
 | §11 Animation | **DEFERRED** | planned only; static figures first |
 | §12 Everything else | **DEFERRED** | clusters, over-relaxation, exact O(3), Ashkin–Teller |
 
 "SKETCH" means the design is recorded here in enough detail to build from, and deliberately not
 built. "DEFERRED" means not now, with the reason recorded so the decision is revisitable.
+
+**What landed, against what was planned.** Phases 0–5 plus Potts. Three deviations, all recorded
+where they belong:
+
+- **Potts was built**, not left as a sketch (§5). It was wanted for its own sake, and it turned
+  out to pay for itself as a test: the `q = 3` clock and Potts conditionals are identical at
+  `J_Potts = 3J/2`, which cross-checks both.
+- **`oklch_ring` grew a `uniform_chroma` switch** (§3). The uniform-chroma ring the plan called
+  for is genuinely washed out — the whole ring gets throttled to whatever chroma the blues can
+  manage — so per-hue maxima are now available and are what `demo.py` uses. Equal lightness is
+  the claim that matters and it is unchanged; see §3.
+- **`ClockModel.phase_field` was added**, which the plan did not anticipate. The intermediate
+  phase is long-wavelength and a raw microstate buries it in site-level speckle; nothing in the
+  plan would have shown it. It also turned out to be the natural home for the vortex work in §6.
+
+One planned claim did not survive contact: the plan assumed a static figure could be a plain run
+at temperature. It cannot, below `T_c` — a quench from disorder has to coarsen through `O(L**2)`
+sweeps and freezes into a picture of its own history. `demo.py` starts cold instead, and its
+docstring records the hot-versus-cold comparison that establishes the difference.
 
 ---
 
@@ -50,7 +69,8 @@ built. "DEFERRED" means not now, with the reason recorded so the decision is rev
 | `spinvector.py` | new, phase 3 | `VectorModel` base: unit-vector state, energy, order parameter |
 | `xy.py` | new, phase 3 | `XYModel(VectorModel)` |
 | `heisenberg.py` | new, phase 4 | `HeisenbergModel(VectorModel)` |
-| `potts.py` | *not written* | §5 is the design; build only if the δ-coupling is wanted for itself |
+| `potts.py` | **new** | built after all; see the scope note above |
+| `demo.py` | **new** | interactive multi-panel figures, §10 |
 | `model.py` | **touched** | `Model` delegates to `Lattice`; public API byte-identical |
 | `test_model.py` | **untouched** | all 30 tests must still pass — that is the refactor's acceptance criterion |
 | `test_lattice.py`, `test_clock.py`, `test_palette.py` | **new** | §9 |
